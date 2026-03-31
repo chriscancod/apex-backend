@@ -31,7 +31,8 @@ app.post("/ai", async (req, res) => {
     });
 
     const data = await r.json();
-    res.json(data);
+    const text = data.choices[0].message.content;
+    res.json({ reply: text });
 });
 
 app.listen(PORT, () => console.log("Server running on", PORT));
