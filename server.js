@@ -6,36 +6,31 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
-const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 const SYSTEM_PROMPT = `
-You are the APEX AI, a high-level strategist for a young entrepreneur. 
-MODES:
-1. CHAT: Be concise, professional, and dark-luxury toned. Give high-level advice.
-2. PARSE: If the user provides a schedule or a list of text, extract the actionable tasks.
-   - Return ONLY a comma-separated list of tasks. 
-   - Example: "Finish Python script, Walk dog, Review Noctis designs"
+You are the APEX AI Strategist for a young tech founder. 
+- Mode 'chat': High-level business advice. Stay concise. 
+- Mode 'parse': Extract specific tasks from the provided text. Return ONLY a comma-separated list of tasks.
 `;
 
 app.post("/ai", async (req, res) => {
-    const { prompt, mode } = req.body; // mode: 'chat' or 'parse'
+    const { prompt, mode, image } = req.body;
+    let content = [{ type: "text", text: prompt }];
+    if (image) content.push({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${image}` } });
 
     try {
-        const r = await fetch("https://api.openai.com/v1/chat/completions", {
+        const response = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
             headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
             body: JSON.stringify({
                 model: "gpt-4o-mini",
-                messages: [
-                    { role: "system", content: SYSTEM_PROMPT },
-                    { role: "user", content: prompt }
-                ]
+                messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: content }]
             })
         });
-        const data = await r.json();
+        const data = await response.json();
         res.json({ reply: data.choices[0].message.content });
-    } catch (e) { res.status(500).json({ reply: "OFFLINE" }); }
+    } catch (e) { res.status(500).json({ error: "CORE_OFFLINE" }); }
 });
 
-app.listen(PORT, () => console.log("APEX AI Core Online"));
+app.listen(process.env.PORT || 3000);
