@@ -1,14 +1,16 @@
-const express = require('express');
-const OpenAI = require('openai');
+import express from "express";
+import cors from "cors";
+import fetch from "node-fetch";
+
 const app = express();
+app.use(cors());
+// Increased limit for high-res fridge photos
+app.use(express.json({ limit: "50mb" }));
 
-app.use(express.json({ limit: '50mb' }));
+const PORT = process.env.PORT || 3000;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Set your OPEN_AI_KEY in Railway Variables
-const openai = new OpenAI({
-  apiKey: process.env.OPEN_AI_KEY,
-});
-
+// STRATEGIST CONFIG
 const STRATEGIST_PROMPT = `
 You are the APEX Lead Strategist for a 13yo founder of Night.inc and Noctis.
 Your goal is to build a high-performance 'Chris Mode' schedule.
@@ -20,33 +22,54 @@ INSTRUCTIONS:
 4. FORMATTING: Use monospaced blocks for schedules. For the 'Auto-Generate' feature, return a comma-separated list.
 `;
 
-app.post('/ai', async (req, res) => {
+app.get("/", (req, res) => {
+    res.send("APEX Strategist Core Online.");
+});
+
+app.post("/ai", async (req, res) => {
+    const { prompt, image } = req.body;
+
+    // Prepare content structure for GPT-4o
+    let userContent = [{ type: "text", text: prompt }];
+    
+    if (image) {
+        userContent.push({
+            type: "image_url",
+            image_url: { url: `data:image/jpeg;base64,${image}` }
+        });
+    }
+
     try {
-        const { prompt, image } = req.body;
-        let content = [{ type: "text", text: prompt }];
-
-        if (image) {
-            content.push({
-                type: "image_url",
-                image_url: { url: `data:image/jpeg;base64,${image}` }
-            });
-        }
-
-        const response = await openai.chat.completions.create({
-            model: "gpt-4o",
-            messages: [
-                { role: "system", content: STRATEGIST_PROMPT },
-                { role: "user", content: content }
-            ],
-            max_tokens: 800,
+        const r = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${OPENAI_API_KEY}`,
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                model: "gpt-4o-mini", // Optimized for speed and cost
+                messages: [
+                    { role: "system", content: STRATEGIST_PROMPT },
+                    { role: "user", content: userContent }
+                ],
+                max_tokens: 800
+            })
         });
 
-        res.json({ reply: response.choices[0].message.content });
+        const data = await r.json();
+        
+        if (data.error) {
+            console.error("OpenAI Error:", data.error);
+            return res.status(500).json({ reply: "API Error: " + data.error.message });
+        }
+
+        const text = data.choices[0].message.content;
+        res.json({ reply: text });
+
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ reply: "STRATEGIST_OFFLINE: Connection Error." });
+        console.error("Server Error:", error);
+        res.status(500).json({ reply: "STRATEGIST_OFFLINE: Connection failed." });
     }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`APEX Backend live on ${PORT}`));
+app.listen(PORT, () => console.log("APEX Strategist running on port", PORT));
