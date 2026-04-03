@@ -3,27 +3,20 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 
 const app = express();
-
-// MIDDLEWARE
 app.use(cors());
 app.use(bodyParser.json());
 
-// THE STABLE AI ENDPOINT
 app.post('/ai', (req, res) => {
     const { message, username } = req.body;
-    
-    console.log(`RECEIVED FROM ${username}: ${message}`);
+    console.log(`LOG // INCOMING: ${message} FROM: ${username}`);
 
-    // V11 STABLE LOGIC: Confirms receipt and mirrors the user name
-    const systemResponse = `PROTOCOL_ACCEPTED // Operator ${username || 'CHRIS'}, your command "${message}" has been logged to NightOS. Deployment pending.`;
+    // Stable response logic
+    const reply = `SYSTEM // Command "${message}" received, Operator ${username || 'CHRIS'}. APEX V11 is operating in stable mode.`;
 
     res.status(200).json({
-        response: systemResponse
+        response: reply
     });
 });
 
-// PORT CONFIG
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`APEX_CORE_V11_ONLINE ON PORT ${PORT}`);
-});
+app.listen(PORT, () => console.log(`APEX_STABLE_ONLINE // PORT ${PORT}`));
