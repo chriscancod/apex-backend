@@ -1,48 +1,29 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const { OpenAI } = require('openai');
 
 const app = express();
+
+// MIDDLEWARE
 app.use(cors());
 app.use(bodyParser.json());
 
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY, // Pulls from Railway Variables
+// THE STABLE AI ENDPOINT
+app.post('/ai', (req, res) => {
+    const { message, username } = req.body;
+    
+    console.log(`RECEIVED FROM ${username}: ${message}`);
+
+    // V11 STABLE LOGIC: Confirms receipt and mirrors the user name
+    const systemResponse = `PROTOCOL_ACCEPTED // Operator ${username || 'CHRIS'}, your command "${message}" has been logged to NightOS. Deployment pending.`;
+
+    res.status(200).json({
+        response: systemResponse
+    });
 });
 
-app.post('/ai', async (req, res) => {
-    try {
-        const { message, mode, username } = req.body;
-
-        // SYSTEM PROMPT: This defines the "Personality" of APEX
-        const systemRole = `You are APEX, the AI Operating System for Night.inc. 
-        Your user is ${username}, a 13-year-old software architect and entrepreneur. 
-        Keep responses minimalist, futuristic, and high-utility. 
-        If mode is 'parse', return a comma-separated list of 3-5 tasks.
-        Otherwise, provide elite strategic advice.`;
-
-       // DELETE THIS OLD STAGE:
-// let aiResponse = "Operator Chris, focusing on your tech architecture now"; 
-
-// USE THIS REAL STAGE:
-const completion = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [{ role: "user", content: message }]
-});
-let aiResponse = completion.choices[0].message.content;
-
-        res.status(200).json({
-            response: aiReply
-        });
-
-    } catch (error) {
-        console.error("AI_ERROR:", error);
-        res.status(500).json({ response: "SYSTEM_OFFLINE // CHECK_API_CREDITS" });
-    }
-});
-
+// PORT CONFIG
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`APEX_NEURAL_CORE_ONLINE on ${PORT}`);
+    console.log(`APEX_CORE_V11_ONLINE ON PORT ${PORT}`);
 });
