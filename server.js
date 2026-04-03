@@ -22,16 +22,15 @@ app.post('/ai', async (req, res) => {
         If mode is 'parse', return a comma-separated list of 3-5 tasks.
         Otherwise, provide elite strategic advice.`;
 
-        const completion = await openai.chat.completions.create({
-            model: "gpt-4o", // Or "gpt-3.5-turbo" if you want to save money
-            messages: [
-                { role: "system", content: systemRole },
-                { role: "user", content: message }
-            ],
-            temperature: 0.7,
-        });
+       // DELETE THIS OLD STAGE:
+// let aiResponse = "Operator Chris, focusing on your tech architecture now"; 
 
-        const aiReply = completion.choices[0].message.content;
+// USE THIS REAL STAGE:
+const completion = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [{ role: "user", content: message }]
+});
+let aiResponse = completion.choices[0].message.content;
 
         res.status(200).json({
             response: aiReply
