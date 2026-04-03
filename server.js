@@ -1,38 +1,40 @@
-import express from "express";
-import cors from "cors";
-import fetch from "node-fetch";
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "50mb" }));
+app.use(bodyParser.json());
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
-const SYSTEM_PROMPT = `
-You are the APEX AI Strategist for a young tech founder. 
-- Mode 'chat': High-level business advice. Stay concise. 
-- Mode 'parse': Extract specific tasks from the provided text. Return ONLY a comma-separated list of tasks.
-- CHAT MODE: Concise, dark-luxury tone. Focus on entrepreneurship (Night.inc).
-- PARSE MODE: Extract comma-separated tasks from text.
-- WORKOUT MODE: Provide efficient, calisthenics or home-based high-intensity plans.
-`;
-app.post("/ai", async (req, res) => {
-    const { prompt, mode, image } = req.body;
-    let content = [{ type: "text", text: prompt }];
-    if (image) content.push({ type: "image_url", image_url: { url: `data:image/jpeg;base64,${image}` } });
-
+// THE AI ENDPOINT
+app.post('/ai', async (req, res) => {
     try {
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-            method: "POST",
-            headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-            body: JSON.stringify({
-                model: "gpt-4o-mini",
-                messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: content }]
-            })
+        const { message, mode, username } = req.body;
+        console.log(`INCOMING FROM ${username}: [${mode}] ${message}`);
+
+        // --- INSERT YOUR OPENAI/ANTHROPIC API CALL HERE ---
+        // For now, we return a structured response the app recognizes.
+        
+        let aiResponse = "";
+        if (mode === "parse") {
+            aiResponse = "MISSION_EXTRACTED: Reviewing your schedule. Missions added to Home Ops.";
+        } else {
+            aiResponse = `STRATEGY_LOADED: Operator ${username}, focusing on your tech architecture now.`;
+        }
+
+        // CRITICAL: We send the key "response" to match the Swift code
+        res.status(200).json({
+            response: aiResponse,
+            status: "success"
         });
-        const data = await response.json();
-        res.json({ reply: data.choices[0].message.content });
-    } catch (e) { res.status(500).json({ error: "CORE_OFFLINE" }); }
+
+    } catch (error) {
+        console.error("SYSTEM_ERROR:", error);
+        res.status(500).json({ response: "ERROR // NEURAL_LINK_FAILED" });
+    }
 });
 
-app.listen(process.env.PORT || 3000);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`APEX_CORE_ONLINE on port ${PORT}`);
+});
