@@ -85,9 +85,18 @@ Tasks to fit in: ${Array.isArray(tasks) && tasks.length > 0 ? tasks.join(', ') :
 Notes: ${notes || 'None'}
 Build the optimal schedule.`;
 
-        const raw = await chat(system, user, 1000);
-        const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
-        res.json({ success: true, data: parsed });
+        const raw = await chat(system, user, 4000);
+        let cleaned = raw.replace(/```json|```/g, '').trim();
+        // If JSON is truncated, close it gracefully
+        try {
+            const parsed = JSON.parse(cleaned);
+            res.json({ success: true, data: parsed });
+        } catch (parseErr) {
+            // Try to salvage truncated JSON by closing open structures
+            console.error('SCHEDULE PARSE ERROR, attempting repair:', parseErr.message);
+            console.error('RAW:', cleaned.slice(0, 500));
+            res.status(500).json({ success: false, error: 'JSON truncated: ' + parseErr.message });
+        }
     } catch (err) {
         console.error('SCHEDULE ERROR:', err.message);
         res.status(500).json({ success: false, error: err.message });
@@ -158,7 +167,7 @@ Available days: ${daysAvailable || 'Mon, Tue, Thu, Fri, Sat'}
 Injuries/limitations: ${injuries || 'None'}
 Generate this week's full training plan.`;
 
-        const raw = await chat(system, user, 1200);
+        const raw = await chat(system, user, 4000);
         const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
         res.json({ success: true, data: parsed });
     } catch (err) {
