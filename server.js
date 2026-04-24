@@ -79,11 +79,13 @@ Respond ONLY in this exact JSON format with no markdown, no backticks, nothing e
 Categories must be one of: fitness, study, biz, ops, rest, church.`;
 
         const user = `Date: ${date || 'Today'}
+Current day: ${req.body.currentDay || 'Unknown'}
+Current time RIGHT NOW: ${req.body.currentTime || 'Unknown'} — build the schedule starting from the NEXT upcoming block after this time. Mark any blocks that are already past with a note.
 Wake time: ${wakeTime || '6:00 AM'}
 Sleep time: ${sleepTime || '11:00 PM'}
-Tasks to fit in: ${Array.isArray(tasks) && tasks.length > 0 ? tasks.join(', ') : 'None specified'}
+Active tasks to fit in: ${Array.isArray(tasks) && tasks.length > 0 ? tasks.join(', ') : 'None'}
 Notes: ${notes || 'None'}
-Build the optimal schedule.`;
+Build the full day schedule. Be extremely specific about each block based on the Batman Protocol. Include the exact time for every block.`;
 
         const raw = await chat(system, user, 4000);
         let cleaned = raw.replace(/```json|```/g, '').trim();
