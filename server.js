@@ -78,14 +78,22 @@ Respond ONLY in this exact JSON format with no markdown, no backticks, nothing e
 }
 Categories must be one of: fitness, study, biz, ops, rest, church.`;
 
+        const hasNotes = notes && notes.trim().length > 0;
+        const hasTasks = Array.isArray(tasks) && tasks.length > 0;
+
         const user = `Date: ${date || 'Today'}
 Current day: ${req.body.currentDay || 'Unknown'}
-Current time RIGHT NOW: ${req.body.currentTime || 'Unknown'} — build the schedule starting from the NEXT upcoming block after this time. Mark any blocks that are already past with a note.
+Current time RIGHT NOW: ${req.body.currentTime || 'Unknown'} — build schedule from NEXT upcoming block. Skip past blocks.
 Wake time: ${wakeTime || '6:00 AM'}
 Sleep time: ${sleepTime || '11:00 PM'}
-Active tasks to fit in: ${Array.isArray(tasks) && tasks.length > 0 ? tasks.join(', ') : 'None'}
-Notes: ${notes || 'None'}
-Build the full day schedule. Be extremely specific about each block based on the Batman Protocol. Include the exact time for every block.`;
+
+${hasTasks ? `ACTIVE MISSIONS (schedule these as dedicated blocks):\n${tasks.map((t, i) => `${i+1}. ${t}`).join('\n')}` : 'No active missions.'}
+
+${hasNotes ? `OPERATOR PRIORITY OVERRIDE — MANDATORY. Build the schedule around these. Create dedicated detailed blocks for each:
+"${notes}"
+These override the default protocol where needed.` : 'No priority overrides — follow standard Batman Protocol.'}
+
+Build the full day. Every block must be extremely specific with exact actions.`;
 
         const raw = await chat(system, user, 4000);
         let cleaned = raw.replace(/```json|```/g, '').trim();
