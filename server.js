@@ -134,10 +134,10 @@ app.post('/kinetic/hrv', async (req, res) => {
 
 
 // ════════════════════════════════════════════════════════════════════════════
-// INDEX — knowledge vault
+// INDEX — knowledge vault + AI curriculum (matches Swift app exactly)
 // ════════════════════════════════════════════════════════════════════════════
 
-// POST /index/search  body: { query, documents:[{title,content,language}] }
+// POST /index/search
 app.post('/index/search', async (req, res) => {
   try {
     const { query, documents = [] } = req.body;
@@ -151,7 +151,7 @@ app.post('/index/search', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /index/summarize  body: { content, title }
+// POST /index/summarize
 app.post('/index/summarize', async (req, res) => {
   try {
     const { content, title } = req.body;
@@ -164,7 +164,7 @@ app.post('/index/summarize', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /index/explain  body: { code, language }
+// POST /index/explain
 app.post('/index/explain', async (req, res) => {
   try {
     const { code, language } = req.body;
@@ -174,6 +174,88 @@ app.post('/index/explain', async (req, res) => {
       true
     );
     res.json(JSON.parse(out));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /ai/curriculum/build
+// Body: { topic, depth, style, lesson_count }
+// Returns: { curriculum: CurriculumPlan } — exact shape the Swift CurriculumBuildResponse expects
+app.post('/ai/curriculum/build', async (req, res) => {
+  try {
+    const { topic, depth = 'beginner', style = 'practical', lesson_count = 5 } = req.body;
+
+    const styleGuide = style === 'practical'
+      ? 'Focus on code examples and hands-on exercises with working code snippets.'
+      : style === 'theoretical'
+      ? 'Focus on concepts, theory, definitions, and mental models.'
+      : 'Build toward a real mini-project. Each lesson is a step toward the final build.';
+
+    const depthGuide = depth === 'beginner'
+      ? 'Assume no prior knowledge. Keep language simple.'
+      : depth === 'intermediate'
+      ? 'Assume basic familiarity. Go deeper into mechanics.'
+      : 'Assume solid foundation. Cover advanced edge cases and internals.';
+
+    const out = await ask(
+      `You are INDEX, an expert curriculum builder. ${styleGuide} ${depthGuide}
+Return ONLY valid JSON — no markdown, no backticks, no preamble.`,
+      `Build a ${lesson_count}-lesson curriculum on: "${topic}"
+
+Return this exact JSON shape:
+{
+  "curriculum": {
+    "id": "<uuid string>",
+    "topic": "${topic}",
+    "tagline": "<one punchy sentence describing what they'll master>",
+    "total_xp": <number>,
+    "earned_xp": 0,
+    "lessons": [
+      {
+        "id": "<uuid string>",
+        "title": "<lesson title>",
+        "emoji": "<single relevant emoji>",
+        "summary": "<one sentence — what this lesson covers>",
+        "content": "<full lesson in markdown — use ## headers, bullet points, code blocks>",
+        "key_points": ["<point>", "<point>", "<point>"],
+        "xp": <number between 50-200>,
+        "completed": false,
+        "quiz_passed": false,
+        "quiz": [
+          {
+            "id": "<uuid string>",
+            "question": "<question text>",
+            "options": ["<A>", "<B>", "<C>", "<D>"],
+            "correct_index": <0-3>,
+            "user_answer": null
+          }
+        ]
+      }
+    ]
+  }
+}
+
+Make exactly ${lesson_count} lessons. Each lesson must have exactly 3 quiz questions. XP per lesson should be between 50-200. total_xp should equal the sum of all lesson xp values.`,
+      true
+    );
+
+    res.json(JSON.parse(out));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /ai/curriculum/chat
+// Body: { message, lesson_context, topic }
+// Returns: { reply: string }
+app.post('/ai/curriculum/chat', async (req, res) => {
+  try {
+    const { message, lesson_context, topic } = req.body;
+    const reply = await ask(
+      `You are INDEX, an expert tutor teaching "${topic || 'this topic'}". 
+You are currently in a lesson: ${lesson_context || 'general'}
+Be concise, clear, and helpful. Use code examples when relevant. 
+Never go off-topic — always tie answers back to the lesson content.`,
+      message
+    );
+    res.json({ reply });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -250,24 +332,6 @@ app.post('/aura/score', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-
-// POST /ai/curriculum/build  body: { topic, style, lessons, level }
-app.post('/ai/curriculum/build', async (req, res) => {
-  try {
-    const { topic, style = 'Practical', lessons = 5, level = 'beginner' } = req.body;
-    const styleGuide = style === 'Practical'
-      ? 'Focus on code examples and hands-on exercises.'
-      : style === 'Theoretical'
-      ? 'Focus on concepts, definitions, and theory.'
-      : 'Focus on building a real project step by step.';
-    const out = await ask(
-      `You are INDEX, a knowledge curriculum builder. ${styleGuide} Return JSON only.`,
-      `Topic: "${topic}" Level: ${level} Number of lessons: ${lessons}\n\nJSON format: { title, description, lessons:[{ number, title, objective, content, exercise, codeExample }] }`,
-      true
-    );
-    res.json(JSON.parse(out));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
 
 // ════════════════════════════════════════════════════════════════════════════
 // DECK — audio / podcast
