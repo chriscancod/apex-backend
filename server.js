@@ -251,6 +251,24 @@ app.post('/aura/score', async (req, res) => {
 });
 
 
+// POST /ai/curriculum/build  body: { topic, style, lessons, level }
+app.post('/ai/curriculum/build', async (req, res) => {
+  try {
+    const { topic, style = 'Practical', lessons = 5, level = 'beginner' } = req.body;
+    const styleGuide = style === 'Practical'
+      ? 'Focus on code examples and hands-on exercises.'
+      : style === 'Theoretical'
+      ? 'Focus on concepts, definitions, and theory.'
+      : 'Focus on building a real project step by step.';
+    const out = await ask(
+      `You are INDEX, a knowledge curriculum builder. ${styleGuide} Return JSON only.`,
+      `Topic: "${topic}" Level: ${level} Number of lessons: ${lessons}\n\nJSON format: { title, description, lessons:[{ number, title, objective, content, exercise, codeExample }] }`,
+      true
+    );
+    res.json(JSON.parse(out));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // DECK — audio / podcast
 // ════════════════════════════════════════════════════════════════════════════
