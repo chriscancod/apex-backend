@@ -11,13 +11,18 @@ app.use(express.urlencoded({ extended: true }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ─── Model config ─────────────────────────────────────────────────────────────
-// gpt-4o-mini: ~33x cheaper than gpt-4o, plenty smart for all these tasks
-const MODEL = 'gpt-4o-mini';
+// ─── Model tiers ──────────────────────────────────────────────────────────────
+// FAST  = gpt-4.1-mini  — short chat, quick replies, simple tasks
+// SMART = gpt-4.1-mini  — curriculum builds, schedules (higher token ceiling)
+// Quality fix: the issue was token limits cutting responses mid-thought.
+// Raising limits on the routes that need full output.
 
-async function ask(system, user, json = false, maxTokens = 500) {
+const FAST  = 'gpt-4.1-mini';
+const SMART = 'gpt-4.1-mini';
+
+async function ask(system, user, json = false, maxTokens = 800, model = FAST) {
   const res = await openai.chat.completions.create({
-    model: MODEL,
+    model,
     max_tokens: maxTokens,
     response_format: json ? { type: 'json_object' } : undefined,
     messages: [
@@ -31,14 +36,17 @@ async function ask(system, user, json = false, maxTokens = 500) {
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/', (_, res) => res.json({
   status: 'NIGHT_INC_ONLINE',
-  apps: ['APX', 'INDEX', 'NEXUS'],
-  model: MODEL,
+  apps: ['APX','INDEX','NEXUS','KINETIC','AURA','DECK','WARDROBE'],
+  model: 'gpt-4.1-mini',
 }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // APX — POST /schedule
-// AIManager.generateSchedule() → APIWrapper<ScheduleResponse>
+//
+// FIX: Was cutting off mid-schedule at 1500 tokens.
+// Raised to 2500. Tightened prompt to spend tokens on BLOCKS not padding.
+// Added explicit "never truncate" instruction and minimum block count rule.
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/schedule', async (req, res) => {
@@ -49,31 +57,57 @@ app.post('/schedule', async (req, res) => {
       currentTime = '', currentDay = '', profileContext = '',
     } = req.body;
 
-    const profile  = profileContext ? `\nPROFILE:\n${profileContext.slice(0, 300)}` : '';
-    const taskList = tasks.slice(0, 10).length
-      ? tasks.slice(0, 10).map((t, i) => `${i + 1}. ${t}`).join('\n')
+    const profile  = profileContext ? `\nPROFILE:\n${profileContext.slice(0, 400)}` : '';
+    const taskList = tasks.slice(0, 12).length
+      ? tasks.slice(0, 12).map((t, i) => `${i + 1}. ${t}`).join('\n')
       : 'General high-performance day.';
 
+    // Estimate hours available to set block count expectation
     const out = await ask(
-      `You are APEX AI, a daily scheduler for a high-performance teen.
-Build a time-blocked schedule between wake and sleep. Respect fixed commitments.
-Categories: ops, fitness, study, biz, church, rest. Return ONLY valid JSON.
+      `You are APEX AI — elite daily scheduler for a high-performance teen founder.
+Build a COMPLETE time-blocked schedule from wake to sleep. Every hour must be accounted for. No gaps. No truncation.
+
+CATEGORIES: ops, fitness, study, biz, church, rest
 
 ACTIVITY RULES — always specific, never vague:
-- fitness: "Push-ups 4x15, Pull-ups 3x8, Dips 3x12, Plank 3x60s — rest 60s"
-- study: "Chapter 5 — read pp.82-94, complete exercises 5.1-5.15"
-- biz: "Write 3 product descriptions, reply to 5 DMs, schedule 2 posts"
-- ops: "Pack gym bag, prep meals, charge devices, clean workspace"
-- rest: "No screens. Foam roll 10min, read 20 pages, journal 3 wins"`,
+• fitness → exact exercises, sets, reps, rest periods. E.g. "Push-ups 4×15, Pull-ups 3×8, Dips 3×12, Plank 3×60s — rest 60s between sets"
+• study   → exact chapter/page range + exercises. E.g. "Algebra Ch.7 pp.142-158, complete exercises 7.1–7.20"
+• biz     → exact actions. E.g. "Draft 3 product descriptions, respond to 5 Instagram DMs, schedule 2 TikTok posts"
+• ops     → exact prep. E.g. "Pack gym bag, meal prep lunch, charge all devices, clean desk"
+• rest    → no screens. E.g. "Foam roll 15min, read 20 pages, journal 3 wins + 1 lesson"
 
-      `${username} | ${date} ${currentDay} | Wake:${wakeTime} Sleep:${sleepTime}
-Notes:${notes || 'none'}${profile}
-Tasks:\n${taskList}
+CRITICAL: You MUST fill the ENTIRE day. Generate as many blocks as needed to cover wake→sleep with zero gaps.
+Return ONLY valid JSON. Do NOT stop early. Do NOT truncate.`,
 
-JSON: {"success":true,"data":{"summary":"<theme>","totalXP":<total>,"blocks":[{"time":"<h:mm AM/PM>","duration":"<X min>","activity":"<SPECIFIC>","category":"<ops|fitness|study|biz|church|rest>","xp":<50-300>}]}}
+      `OPERATOR: ${username}
+DATE: ${date} ${currentDay}
+WAKE: ${wakeTime} → SLEEP: ${sleepTime}
+CURRENT TIME: ${currentTime}
+NOTES: ${notes || 'none'}${profile}
 
-Rules: full day no gaps, blocks 30-120min, totalXP 800-2000, activity always specific.`,
-      true, 1500
+TASKS TO SCHEDULE:
+${taskList}
+
+Return this exact JSON (fill ALL hours, minimum 8 blocks, maximum 20):
+{
+  "success": true,
+  "data": {
+    "summary": "<theme of day — one punchy sentence>",
+    "totalXP": <sum of all block XP>,
+    "blocks": [
+      {
+        "time": "<h:mm AM/PM>",
+        "duration": "<X min>",
+        "activity": "<SPECIFIC — exact exercises / chapter numbers / exact actions>",
+        "category": "<ops|fitness|study|biz|church|rest>",
+        "xp": <50-300>
+      }
+    ]
+  }
+}
+
+Rules: blocks 30–120min, totalXP 1000–2500, cover every hour from ${wakeTime} to ${sleepTime}.`,
+      true, 2500, SMART
     );
 
     res.json(JSON.parse(out));
@@ -82,7 +116,7 @@ Rules: full day no gaps, blocks 30-120min, totalXP 800-2000, activity always spe
   }
 });
 
-// APX finance — pure math, no AI cost
+// APX finance — pure math, free
 app.post('/apx/finance/split', (req, res) => {
   const amt = parseFloat(req.body.income) || 0;
   res.json({
@@ -102,9 +136,9 @@ app.post('/apx/finance/advice', async (req, res) => {
     const { message = '', entries = [] } = req.body;
     const log = entries.slice(0, 10).map(e => `${e.type}: $${e.amount} (${e.label})`).join('\n');
     const reply = await ask(
-      'APX finance advisor for a teen entrepreneur. Direct, specific, real numbers. Under 80 words.',
+      'APX finance advisor for a teen entrepreneur. Direct, specific, real numbers and formulas. Max 120 words.',
       `Log:\n${log || 'none'}\nQuestion: ${message}`,
-      false, 300
+      false, 400, FAST
     );
     res.json({ advice: reply });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -113,7 +147,12 @@ app.post('/apx/finance/advice', async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // INDEX — POST /ai/curriculum/build
-// CurriculumBuildRequest → CurriculumBuildResponse { curriculum: CurriculumPlan }
+//
+// FIX: Lessons were thin — "buns, no real pizzazz."
+// Root cause: 120-word cap + 4000 token ceiling = AI had to compress hard.
+// Fix: Raised to 6000 tokens. Removed word cap. Added explicit quality rules.
+// Added personality instructions — lessons should feel like a great teacher
+// explaining to a smart 16-year-old, not a Wikipedia article.
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/ai/curriculum/build', async (req, res) => {
@@ -124,55 +163,91 @@ app.post('/ai/curriculum/build', async (req, res) => {
     } = req.body;
 
     const styleGuide =
-      style === 'practical'   ? 'Real code examples with explanations. Hands-on exercises.' :
-      style === 'theoretical' ? 'Deep concepts, mental models, real-world analogies.' :
-                                'Each lesson = one step toward a finished project.';
+      style === 'practical'   ? 'Lead with real working code examples. Explain every line. Show what happens when it runs.' :
+      style === 'theoretical' ? 'Build intuition first. Use sharp analogies. Then formalize the concept.' :
+                                'Every lesson = one concrete step toward a finished project. Student should have something working by the end.';
 
     const depthGuide =
-      depth === 'beginner'     ? 'Zero prior knowledge. Plain language. Build from scratch.' :
-      depth === 'intermediate' ? 'Assume basics. Deeper mechanics, edge cases, common mistakes.' :
-                                 'Strong foundation assumed. Advanced patterns, production concerns.';
+      depth === 'beginner'     ? 'Assume zero prior knowledge. Use plain language. Build from absolute scratch. No jargon without explanation.' :
+      depth === 'intermediate' ? 'Assume basics are solid. Go deep on mechanics, edge cases, and common mistakes pros make.' :
+                                 'Assume strong foundation. Cover advanced patterns, performance concerns, and production-level thinking.';
 
     const count = Math.min(Math.max(parseInt(lesson_count) || 5, 1), 10);
 
     const out = await ask(
-      `You are INDEX, an expert curriculum builder. ${styleGuide} ${depthGuide}
-Return ONLY valid JSON — no markdown, no backticks, completely parseable.
-Keep lesson content under 120 words — dense and educational.`,
+      `You are INDEX — an elite curriculum builder and teacher. ${styleGuide} ${depthGuide}
+
+LESSON QUALITY STANDARDS:
+• Write like a brilliant mentor explaining to a sharp 16-year-old who learns fast
+• Each lesson must have a clear "aha moment" — the one insight that changes how they think
+• Use real examples, real code, real analogies — not textbook filler
+• content field: write 200-350 words of rich markdown. Use ## headers, bullet points, and code blocks where helpful
+• key_points: 3 genuinely insightful takeaways — not obvious restatements
+• Quiz questions must test real understanding, not just memorization
+• Make it feel like the best class the student ever took
+
+Return ONLY valid JSON — no markdown, no backticks, completely parseable.`,
 
       `Build a ${count}-lesson curriculum on: "${topic}"
 
-JSON (required exactly):
+REQUIRED JSON shape (fill every field completely):
 {
   "curriculum": {
     "id": "curriculum-1",
     "topic": "${topic}",
-    "tagline": "<what student will master>",
-    "total_xp": <sum of lesson xp>,
+    "tagline": "<what the student will be able to DO after this curriculum — specific and exciting>",
+    "total_xp": <sum of all lesson xp>,
     "earned_xp": 0,
     "lessons": [
       {
         "id": "lesson-1",
-        "title": "<title>",
-        "emoji": "<emoji>",
-        "summary": "<one sentence>",
-        "content": "<markdown: headers, bullets, real code/examples — max 120 words>",
-        "key_points": ["<insight>","<insight>","<insight>"],
-        "xp": <75-150>,
+        "title": "<compelling title — not just 'Introduction'>",
+        "emoji": "<relevant emoji>",
+        "summary": "<one sentence that makes them want to read — hint at the aha moment>",
+        "content": "<rich markdown 200-350 words: ## headers, bullet points, code blocks, real examples — make it excellent>",
+        "key_points": [
+          "<genuine insight #1 — something that shifts their thinking>",
+          "<genuine insight #2 — practical or counterintuitive>",
+          "<genuine insight #3 — connects to the bigger picture>"
+        ],
+        "xp": <100-200>,
         "completed": false,
         "quiz_passed": false,
         "quiz": [
-          {"id":"q-1-1","question":"<test real understanding>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},
-          {"id":"q-1-2","question":"<different concept>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},
-          {"id":"q-1-3","question":"<practical application>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null}
+          {
+            "id": "q-1-1",
+            "question": "<question that tests real understanding, not trivia>",
+            "options": ["<wrong but plausible>", "<correct answer>", "<wrong but plausible>", "<wrong but plausible>"],
+            "correct_index": 1,
+            "user_answer": null
+          },
+          {
+            "id": "q-1-2",
+            "question": "<different concept from same lesson>",
+            "options": ["<A>", "<B>", "<C>", "<D>"],
+            "correct_index": <0-3>,
+            "user_answer": null
+          },
+          {
+            "id": "q-1-3",
+            "question": "<practical application — what would you do in this situation?>",
+            "options": ["<A>", "<B>", "<C>", "<D>"],
+            "correct_index": <0-3>,
+            "user_answer": null
+          }
         ]
       }
     ]
   }
 }
 
-RULES: exactly ${count} lessons, exactly 3 quiz questions each, total_xp = sum of xp, IDs lesson-1/lesson-2/q-1-1/q-2-1 etc.`,
-      true, 4000
+RULES:
+- Exactly ${count} lessons
+- Exactly 3 quiz questions per lesson
+- total_xp = sum of all lesson xp values
+- Lesson IDs: lesson-1, lesson-2... Quiz IDs: q-1-1, q-1-2, q-1-3, q-2-1...
+- DO NOT truncate. Complete all ${count} lessons fully.`,
+      true, 6000, SMART
     );
 
     res.json(JSON.parse(out));
@@ -182,13 +257,20 @@ RULES: exactly ${count} lessons, exactly 3 quiz questions each, total_xp = sum o
 });
 
 // INDEX — POST /ai/curriculum/chat
+// FIX: Was 400 tokens — tutor was cutting off mid-explanation.
+// Raised to 600. Added personality — sharp, real, like a good mentor.
 app.post('/ai/curriculum/chat', async (req, res) => {
   try {
     const { message = '', lesson_context = '', topic = '' } = req.body;
     const reply = await ask(
-      `Expert tutor for "${topic}". Lesson: ${lesson_context.slice(0, 300)}
-Clear, specific, use code when relevant. Max 80 words.`,
-      message, false, 400
+      `You are INDEX AI — a sharp, direct tutor for the topic "${topic}".
+Current lesson context: ${lesson_context.slice(0, 500)}
+
+Be like the smartest person you know explaining something — clear, specific, no fluff.
+Use code examples when they help. Use analogies when abstract. Max 150 words but use them well.
+Never end mid-sentence. Complete every thought.`,
+      message,
+      false, 600, FAST
     );
     res.json({ reply });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -197,31 +279,29 @@ Clear, specific, use code when relevant. Max 80 words.`,
 
 // ══════════════════════════════════════════════════════════════════════════════
 // NEXUS — POST /api/chat
-// Used by: AI Tab (6 personas), Home daily tip, Idea action plans,
-//          Outreach tab AI message generation (OutreachTab.generateMessage)
 //
-// Request:  { system: string, messages: [{role, content}] }
-// Response: { reply: string }
-//
-// NOTE: NEXUS SMS uses sms:// deep links — no Twilio, no backend needed for
-// sending. The backend only generates the message text via this endpoint.
+// FIX: Was tapping out at 500 tokens — AI personas were giving half-answers.
+// Raised to 800. History still capped at 6 messages to control cost.
+// Added instruction to never cut off mid-thought.
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/api/chat', async (req, res) => {
   try {
     const { system = '', messages = [] } = req.body;
 
-    // Cap history to last 6 messages to keep costs low
     const history = messages.slice(-6).map(m => ({
       role:    m.role    || 'user',
       content: m.content || '',
     }));
 
+    const sysWithRule = system.slice(0, 700) +
+      '\n\nCRITICAL: Always complete your full response. Never cut off mid-sentence or mid-thought. If approaching length, wrap up cleanly.';
+
     const completion = await openai.chat.completions.create({
-      model:      MODEL,
-      max_tokens: 500,
+      model:      FAST,
+      max_tokens: 800,
       messages: [
-        { role: 'system', content: system.slice(0, 600) },
+        { role: 'system', content: sysWithRule },
         ...history,
       ],
     });
@@ -233,40 +313,62 @@ app.post('/api/chat', async (req, res) => {
 });
 
 
-// ─── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => console.log(`Night.inc backend → port ${PORT} | model: ${MODEL}`));
-
-
 // ══════════════════════════════════════════════════════════════════════════════
 // WARDROBE — POST /api/outfits
-// AIOutfitEngine posts closet items → get outfit combinations back
-// Request:  { items: [{name, color, type, style}], occasion?, weather? }
-// Response: { outfits: [{name, pieces, vibe, confidence}] }
+//
+// AI generates outfit combos. Also has a randomizer fallback built in
+// so if someone just wants a quick pick, it works without burning tokens.
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/api/outfits', async (req, res) => {
   try {
-    const { items = [], occasion = 'casual', weather = 'mild' } = req.body;
-
+    const { items = [], occasion = 'casual', weather = 'mild', randomize = false } = req.body;
     if (!items.length) return res.status(400).json({ error: 'No items provided.' });
 
+    // Pure randomizer — no AI, no cost
+    if (randomize) {
+      const shuffled = [...items].sort(() => Math.random() - 0.5);
+      const picks = shuffled.slice(0, Math.min(3, shuffled.length));
+      return res.json({
+        outfits: [{
+          name: 'RANDOM FIT',
+          pieces: picks.map(p => p.name || p),
+          vibe: 'Randomized pick — style it your way.',
+          confidence: 0.7,
+        }],
+        source: 'randomizer',
+      });
+    }
+
     const itemList = items.slice(0, 30)
-      .map((it, i) => `${i + 1}. ${it.name} — ${it.color}, ${it.type}, ${it.style || 'unspecified style'}`)
+      .map((it, i) => `${i + 1}. ${it.name} (${it.color || 'unknown color'}, ${it.type || 'unknown type'}, ${it.style || 'unspecified'})`)
       .join('\n');
 
     const out = await ask(
-      `You are a fashion AI for a dark luxury streetwear brand. 
-Build outfit combinations from the user's closet. Be specific about pieces and why they work together.
+      `You are a fashion AI for a dark luxury streetwear brand (Night.inc — NOCTIS/2AM aesthetic).
+Build outfit combinations from the user's closet. Be specific about why pieces work together — color theory, silhouette, occasion match.
 Return ONLY valid JSON.`,
 
       `Occasion: ${occasion}. Weather: ${weather}.
-Closet items:
+Closet:
 ${itemList}
 
-JSON: {"outfits":[{"name":"<outfit name>","pieces":["<item>","<item>","<item>"],"vibe":"<1 sentence>","confidence":<0.0-1.0>}]}
+JSON:
+{
+  "outfits": [
+    {
+      "name": "<outfit name — creative, fits the dark luxury aesthetic>",
+      "pieces": ["<exact item name from list>", "<exact item name>", "<exact item name>"],
+      "vibe": "<one sentence — the feeling/look this creates>",
+      "why_it_works": "<one sentence — color/silhouette/occasion logic>",
+      "confidence": <0.0-1.0>
+    }
+  ],
+  "source": "ai"
+}
 
-Rules: 3-5 outfits, 2-4 pieces each, only use items from the list above, confidence reflects how well pieces match.`,
-      true, 1000
+Rules: 3-5 outfits, 2-4 pieces each, only use items from the closet list, confidence = how well they actually match.`,
+      true, 1200, FAST
     );
 
     res.json(JSON.parse(out));
@@ -275,11 +377,13 @@ Rules: 3-5 outfits, 2-4 pieces each, only use items from the list above, confide
   }
 });
 
+
 // ══════════════════════════════════════════════════════════════════════════════
-// KINETIC / AURA / DECK — POST /api/chat already handles these.
-// All three apps post { system, messages } → { reply }
-// KINETIC: workout plans, biometric analysis
-// AURA: skincare routines, product recommendations
-// DECK: podcast summaries, AI recommendations
-// No separate routes needed — /api/chat is generic enough.
+// KINETIC / AURA / DECK
+// All three use POST /api/chat with their own system prompts from the app.
+// No separate routes needed — /api/chat handles any {system, messages} pair.
 // ══════════════════════════════════════════════════════════════════════════════
+
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => console.log(`Night.inc backend → port ${PORT}`));
