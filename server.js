@@ -7,13 +7,32 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ─── GPT helper ───────────────────────────────────────────────────────────────
-async function ask(system, user, json = false, maxTokens = 1000) {
+// Twilio — only if configured
+let twilioClient = null;
+if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  const twilio = require('twilio');
+  twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+}
+
+const callScripts   = {};
+const callLog       = {};
+let screenerEnabled = false;
+
+// ─── Model tiers ─────────────────────────────────────────────────────────────
+// CHEAP  = gpt-4o-mini  ~$0.00015/1K input  — used for short/simple tasks
+// NORMAL = gpt-4o-mini  same, with higher token ceiling for curriculum
+// Only use gpt-4o for things that genuinely need it (nothing here does)
+
+const CHEAP  = 'gpt-4o-mini';
+const NORMAL = 'gpt-4o-mini';
+
+async function ask(system, user, json = false, maxTokens = 500, model = CHEAP) {
   const res = await openai.chat.completions.create({
-    model: 'gpt-4o',
+    model,
     max_tokens: maxTokens,
     response_format: json ? { type: 'json_object' } : undefined,
     messages: [
@@ -24,16 +43,32 @@ async function ask(system, user, json = false, maxTokens = 1000) {
   return res.choices[0].message.content;
 }
 
+function escapeXml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
+function requireTwilio(res) {
+  if (!twilioClient) {
+    res.status(503).json({ error: 'Twilio not configured.' });
+    return false;
+  }
+  return true;
+}
+
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/', (_, res) => res.json({
   status: 'NIGHT_INC_ONLINE',
-  apps: ['APX', 'INDEX'],
+  apps: ['APX', 'INDEX', 'NEXUS'],
+  model: CHEAP,
+  twilio: twilioClient ? 'configured' : 'not configured',
 }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// APX  —  POST /schedule
-// Swift: AIManager.generateSchedule() → APIWrapper<ScheduleResponse>
+// APX — POST /schedule
+// Switched to mini. Trimmed prompt. Cut token limit 3000→1500.
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/schedule', async (req, res) => {
@@ -50,67 +85,41 @@ app.post('/schedule', async (req, res) => {
       profileContext = '',
     } = req.body;
 
-    const taskList = tasks.length
-      ? tasks.map((t, i) => `${i + 1}. ${t}`).join('\n')
-      : 'No specific tasks — build a general high-performance day.';
+    // Trim profileContext to 300 chars max to save tokens
+    const profile = profileContext
+      ? `\nPROFILE:\n${profileContext.slice(0, 300)}`
+      : '';
 
-    const profile = profileContext ? `\n\nOPERATOR PROFILE:\n${profileContext}` : '';
+    // Limit tasks to 10
+    const taskList = tasks.slice(0, 10).length
+      ? tasks.slice(0, 10).map((t, i) => `${i + 1}. ${t}`).join('\n')
+      : 'General high-performance day.';
 
     const out = await ask(
-      `You are APEX AI, a ruthlessly efficient daily scheduler for a high-performance teen operator.
-Build a time-blocked schedule using ONLY the hours between wake and sleep.
-Respect every fixed commitment listed in the profile — do not move them.
+      `You are APEX AI, a daily scheduler for a high-performance teen.
+Build a time-blocked schedule between wake and sleep. Respect fixed commitments.
 Categories: ops, fitness, study, biz, church, rest.
-Return ONLY valid JSON — no markdown, no backticks.
+Return ONLY valid JSON.
 
-CRITICAL RULE — the "activity" field must be FULLY DETAILED and immediately actionable.
-NEVER write vague words like "workout", "study session", "business tasks", "rest", "morning routine".
-ALWAYS be specific:
+ACTIVITY RULES — always specific, never vague:
+- fitness: "Push-ups 4x15, Pull-ups 3x8, Dips 3x12, Plank 3x60s"
+- study: "Chapter 5 — read pp.82-94, complete exercises 5.1-5.15"
+- biz: "Write 3 product descriptions, reply to 5 DMs, schedule 2 posts"
+- ops: "Pack gym bag, prep meals, charge devices, clean workspace"
+- rest: "No screens. Foam roll 10min, read 20 pages, journal 3 wins"`,
 
-FITNESS example: "Push-ups 4x15, Pull-ups 3x8, Dips 3x12, Goblet squats 3x12 @ bodyweight, Plank 3x60s — rest 60s between sets"
-STUDY example: "Chapter 5 quadratic equations — read pp.82-94, complete exercises 5.1-5.15, mark wrong answers for review"
-BIZ example: "Write 3 product descriptions for hoodie drop, respond to 5 customer DMs, schedule 2 Instagram posts using Later"
-OPS example: "Pack gym bag (shoes, wraps, water), prep chicken + rice for tomorrow, charge AirPods + phone, wipe desk"
-REST example: "No screens. Foam roll quads + hamstrings 10 min, read 20 pages of current book, journal 3 wins from today"
-CHURCH example: "Thursday service at [location from profile] — arrive 5 min early, bring notebook"
-
-Every block must be specific enough that the operator knows EXACTLY what to do with zero guesswork.`,
-
-      `Operator: ${username}
-Date: ${date} (${currentDay})
-Current time: ${currentTime}
-Wake: ${wakeTime}  |  Sleep: ${sleepTime}
-Notes: ${notes || 'none'}
-${profile}
-
-Pending tasks:
+      `${username} | ${date} ${currentDay} | Wake:${wakeTime} Sleep:${sleepTime}
+Notes:${notes||'none'}${profile}
+Tasks:
 ${taskList}
 
-Return this exact JSON:
-{
-  "success": true,
-  "data": {
-    "summary": "<one punchy sentence — theme of this day>",
-    "totalXP": <sum of all block xp>,
-    "blocks": [
-      {
-        "time": "<h:mm AM/PM>",
-        "duration": "<e.g. 45 min>",
-        "activity": "<FULLY DETAILED — exact exercises with sets/reps, exact study topics, exact biz actions>",
-        "category": "<ops|fitness|study|biz|church|rest>",
-        "xp": <50-300>
-      }
-    ]
-  }
-}
+JSON:
+{"success":true,"data":{"summary":"<theme of day>","totalXP":<total>,"blocks":[{"time":"<h:mm AM/PM>","duration":"<X min>","activity":"<SPECIFIC — exact exercises/tasks>","category":"<ops|fitness|study|biz|church|rest>","xp":<50-300>}]}}
 
-Rules:
-- Cover FULL day from wake to sleep, no gaps
-- Each block 30-120 min
-- Total XP 800-2000
-- Activity field: be as specific as a personal trainer or coach would be`,
+Rules: full day no gaps, blocks 30-120min, totalXP 800-2000, activity always specific.`,
       true,
-      3000
+      1500,
+      CHEAP
     );
 
     res.json(JSON.parse(out));
@@ -121,34 +130,17 @@ Rules:
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// APX  —  POST /apx/fitness  (future use)
-// ══════════════════════════════════════════════════════════════════════════════
-
-app.post('/apx/fitness', async (req, res) => {
-  try {
-    const { goal = 'general fitness', level = 'intermediate', days = 5 } = req.body;
-    const out = await ask(
-      'You are APX fitness coach. Return JSON only.',
-      `Goal: ${goal}  Level: ${level}  Days/week: ${days}
-JSON: { plan:[{ day, focus, exercises:[{ name, sets, reps, rest, notes }] }] }`,
-      true, 1500
-    );
-    res.json(JSON.parse(out));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-
-// ══════════════════════════════════════════════════════════════════════════════
-// APX  —  POST /apx/finance/advice  &  /apx/finance/split
+// APX — finance (mini, 300 tokens max)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/apx/finance/advice', async (req, res) => {
   try {
     const { message = '', entries = [] } = req.body;
-    const log = entries.map(e => `${e.type}: $${e.amount} (${e.label})`).join('\n');
+    const log = entries.slice(0, 10).map(e => `${e.type}: $${e.amount} (${e.label})`).join('\n');
     const reply = await ask(
-      'You are APX finance advisor for a teen entrepreneur. Be direct, practical, specific — give actual numbers and action steps, not generic advice.',
-      `Log:\n${log || 'none'}\n\nQuestion: ${message}`
+      'APX finance advisor for a teen entrepreneur. Be direct and specific — actual numbers, real action steps. Under 100 words.',
+      `Log:\n${log||'none'}\nQuestion: ${message}`,
+      false, 300, CHEAP
     );
     res.json({ advice: reply });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -170,8 +162,8 @@ app.post('/apx/finance/split', (req, res) => {
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// INDEX v5  —  POST /ai/curriculum/build
-// Swift: CurriculumBuildRequest → CurriculumBuildResponse
+// INDEX — POST /ai/curriculum/build
+// Biggest cost savings: mini model + content capped at 120 words + 3000 tokens
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/ai/curriculum/build', async (req, res) => {
@@ -184,96 +176,57 @@ app.post('/ai/curriculum/build', async (req, res) => {
     } = req.body;
 
     const styleGuide =
-      style === 'practical'   ? 'Every lesson must include working, runnable code examples with line-by-line explanation. Exercises must be hands-on.' :
-      style === 'theoretical' ? 'Explain the deep WHY behind every concept. Use real-world analogies. Cover history, trade-offs, mental models.' :
-                                'Each lesson is one concrete step toward a finished project. End with a deliverable the student can run or show.';
+      style === 'practical'   ? 'Include real code examples with explanations.' :
+      style === 'theoretical' ? 'Focus on concepts, mental models, analogies.' :
+                                'Each lesson builds toward a real finished project.';
 
     const depthGuide =
-      depth === 'beginner'     ? 'Assume zero prior knowledge. Define every term first. Use plain language. Build from absolute scratch.' :
-      depth === 'intermediate' ? 'Assume basic familiarity. Go deep on mechanics, gotchas, and edge cases. Show common mistakes and why they happen.' :
-                                 'Assume strong foundation. Cover internals, performance implications, advanced patterns, and real production concerns.';
+      depth === 'beginner'     ? 'Assume zero prior knowledge. Plain language.' :
+      depth === 'intermediate' ? 'Assume basics. Go deeper on mechanics and edge cases.' :
+                                 'Assume strong base. Advanced patterns and production concerns.';
 
     const count = Math.min(Math.max(parseInt(lesson_count) || 5, 1), 10);
 
     const out = await ask(
-      `You are INDEX, a world-class curriculum builder and expert teacher.
-${styleGuide}
-${depthGuide}
-
-CRITICAL RULE — every lesson "content" field must be RICH, DETAILED, and actually teachable:
-- Never write a content field that is a single vague sentence
-- Include real explanations, actual code with comments, concrete examples
-- For code topics: show real syntax, explain each line, show output
-- For math/science: show the actual formula, walk through a worked example
-- For business/soft skills: give real frameworks, actual scripts, real scenarios
-- Key points must be genuine insights, not obvious fluff
-- Quiz questions must test real understanding, not trivia
-
-Return ONLY valid JSON — no markdown fences, no extra text, completely parseable.`,
+      `You are INDEX, an expert curriculum builder. ${styleGuide} ${depthGuide}
+Return ONLY valid JSON — no markdown, no backticks, completely parseable.
+Keep lesson content under 120 words — dense and educational, not padded.`,
 
       `Build a ${count}-lesson curriculum on: "${topic}"
 
-Return this EXACT JSON shape:
+JSON shape (required exactly):
 {
   "curriculum": {
     "id": "curriculum-1",
     "topic": "${topic}",
-    "tagline": "<one punchy sentence — what the student will genuinely master>",
-    "total_xp": <exact sum of all lesson xp>,
+    "tagline": "<what student will master>",
+    "total_xp": <sum of lesson xp>,
     "earned_xp": 0,
     "lessons": [
       {
         "id": "lesson-1",
-        "title": "<specific, descriptive lesson title>",
-        "emoji": "<one relevant emoji>",
-        "summary": "<one sentence — exactly what this lesson teaches>",
-        "content": "<RICH markdown content — ## headers, bullet points, real code blocks with syntax, worked examples, explanations — 150-250 words>",
-        "key_points": [
-          "<genuine insight or rule, not obvious>",
-          "<another real takeaway>",
-          "<a third concrete thing they will know>"
-        ],
-        "xp": <75-200>,
+        "title": "<title>",
+        "emoji": "<emoji>",
+        "summary": "<one sentence>",
+        "content": "<markdown: headers, bullets, real code/examples — max 120 words>",
+        "key_points": ["<insight>","<insight>","<insight>"],
+        "xp": <75-150>,
         "completed": false,
         "quiz_passed": false,
         "quiz": [
-          {
-            "id": "q-1-1",
-            "question": "<question that tests real understanding — not just recall>",
-            "options": ["<wrong but plausible>", "<correct answer>", "<wrong but plausible>", "<wrong but plausible>"],
-            "correct_index": 1,
-            "user_answer": null
-          },
-          {
-            "id": "q-1-2",
-            "question": "<different question, different concept from same lesson>",
-            "options": ["<A>", "<B>", "<C>", "<D>"],
-            "correct_index": <0-3>,
-            "user_answer": null
-          },
-          {
-            "id": "q-1-3",
-            "question": "<third question — practical application>",
-            "options": ["<A>", "<B>", "<C>", "<D>"],
-            "correct_index": <0-3>,
-            "user_answer": null
-          }
+          {"id":"q-1-1","question":"<test real understanding>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},
+          {"id":"q-1-2","question":"<different concept>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},
+          {"id":"q-1-3","question":"<practical application>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null}
         ]
       }
     ]
   }
 }
 
-STRICT RULES:
-- Exactly ${count} lessons
-- Exactly 3 quiz questions per lesson
-- total_xp = exact sum of all lesson xp values
-- Content 150-250 words (enough to be genuinely educational, short enough to complete)
-- Increment IDs: lesson-1, lesson-2... and q-1-1, q-1-2, q-1-3, q-2-1 etc.
-- correct_index must actually match the correct option in the options array
-- All JSON strings properly escaped`,
+RULES: exactly ${count} lessons, exactly 3 quiz questions each, total_xp = sum of xp, IDs lesson-1/lesson-2/q-1-1/q-2-1 etc.`,
       true,
-      8000
+      4000,
+      NORMAL
     );
 
     res.json(JSON.parse(out));
@@ -284,35 +237,21 @@ STRICT RULES:
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// INDEX v5  —  POST /ai/curriculum/chat
-// Swift: LessonChatRequest → LessonChatResponse
+// INDEX — POST /ai/curriculum/chat
+// Mini, 400 tokens max — chat doesn't need much
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/ai/curriculum/chat', async (req, res) => {
   try {
-    const {
-      message        = '',
-      lesson_context = '',
-      topic          = '',
-    } = req.body;
-
+    const { message = '', lesson_context = '', topic = '' } = req.body;
     const reply = await ask(
-      `You are INDEX, an expert tutor teaching "${topic}".
-Current lesson context:
-${lesson_context}
-
-Be a genuinely great tutor:
-- Give detailed, accurate explanations — not one-liners
-- Show real code examples when the question is about code (with comments)
-- Walk through examples step by step
-- If the student is confused, try a different angle or analogy
-- Stay on topic for this lesson
-- Max 150 words — be thorough but concise`,
+      `Expert tutor for "${topic}". Lesson: ${lesson_context.slice(0, 400)}
+Be clear, specific, use code when relevant. Max 80 words.`,
       message,
       false,
-      800
+      400,
+      CHEAP
     );
-
     res.json({ reply });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -321,9 +260,160 @@ Be a genuinely great tutor:
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Start
+// NEXUS — POST /api/chat
+// AIEngine.send() — AI tab, home tip, idea plans, script gen
+// Mini, 500 tokens
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.listen(PORT, () =>
-  console.log(`Night.inc backend online → port ${PORT}`)
-);
+app.post('/api/chat', async (req, res) => {
+  try {
+    const { system = '', messages = [] } = req.body;
+
+    // Limit conversation history to last 6 messages to save tokens
+    const history = messages.slice(-6).map(m => ({ role: m.role, content: m.content }));
+
+    const completion = await openai.chat.completions.create({
+      model: CHEAP,
+      max_tokens: 500,
+      messages: [
+        { role: 'system', content: system.slice(0, 600) }, // cap system prompt
+        ...history,
+      ],
+    });
+
+    res.json({ reply: completion.choices[0].message.content });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// NEXUS AUTOMATE — Twilio endpoints (no AI cost, just Twilio cost)
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.post('/call/outbound', async (req, res) => {
+  if (!requireTwilio(res)) return;
+  try {
+    const { to, name = '', script = '' } = req.body;
+    if (!to) return res.status(400).json({ error: 'Missing "to" phone number.' });
+    callScripts[to] = script || `Hello ${name||'there'}, automated message from ${process.env.BUSINESS_NAME||'our business'}. Please call us back. Thank you!`;
+    const BASE = process.env.BASE_URL || `https://localhost:${PORT}`;
+    const call = await twilioClient.calls.create({
+      to, from: process.env.TWILIO_PHONE_NUMBER,
+      url: `${BASE}/call/twiml?to=${encodeURIComponent(to)}`,
+      statusCallback: `${BASE}/call/status`,
+      statusCallbackMethod: 'POST',
+      statusCallbackEvent: ['initiated','ringing','answered','completed'],
+    });
+    callLog[call.sid] = { status: call.status, to, name, duration: 0 };
+    res.json({ callSid: call.sid, status: call.status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/call/twiml', (req, res) => {
+  const { to = '' } = req.query;
+  const script = callScripts[to] || 'Hello, automated message. Please call us back. Thank you!';
+  res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Matthew-Neural">${escapeXml(script)}</Say>
+  <Pause length="2"/>
+  <Say voice="Polly.Matthew-Neural">To speak with us, please call back. Have a great day!</Say>
+</Response>`);
+});
+
+app.post('/call/status', (req, res) => {
+  const { CallSid, CallStatus, CallDuration, To } = req.body;
+  if (CallSid) {
+    callLog[CallSid] = { ...(callLog[CallSid]||{}), status: CallStatus||'unknown', duration: CallDuration||0, to: To };
+    if (['completed','failed','no-answer','busy','canceled'].includes(CallStatus) && callScripts[To]) delete callScripts[To];
+  }
+  res.sendStatus(200);
+});
+
+app.get('/call/status/:sid', async (req, res) => {
+  const { sid } = req.params;
+  if (callLog[sid]) return res.json({ sid, ...callLog[sid] });
+  if (!requireTwilio(res)) return;
+  try {
+    const call = await twilioClient.calls(sid).fetch();
+    res.json({ sid, status: call.status, duration: call.duration, to: call.to });
+  } catch (e) { res.status(404).json({ error: 'Call not found', sid }); }
+});
+
+app.get('/call/queue', async (req, res) => {
+  if (!requireTwilio(res)) return;
+  try {
+    const calls = await twilioClient.calls.list({ limit: 20 });
+    res.json(calls.map(c => ({ sid: c.sid, status: c.status, to: c.to, name: callLog[c.sid]?.name||'', duration: c.duration })));
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/sms/send', async (req, res) => {
+  if (!requireTwilio(res)) return;
+  try {
+    const { to, message } = req.body;
+    if (!to || !message) return res.status(400).json({ error: 'Missing "to" or "message".' });
+    const msg = await twilioClient.messages.create({ to, from: process.env.TWILIO_PHONE_NUMBER, body: message });
+    res.json({ smsSid: msg.sid, status: msg.status });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/inbound/config', (req, res) => {
+  screenerEnabled = Boolean(req.body.enabled);
+  res.json({ enabled: screenerEnabled });
+});
+
+app.post('/inbound/voice', (req, res) => {
+  const BASE    = process.env.BASE_URL || `https://localhost:${PORT}`;
+  const bizName = escapeXml(process.env.BUSINESS_NAME || 'our business');
+  if (!screenerEnabled) {
+    const real = process.env.YOUR_REAL_NUMBER;
+    return res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>${real ? `<Dial>${escapeXml(real)}</Dial>` : `<Say voice="Polly.Matthew-Neural">Thanks for calling ${bizName}. Please call back or text us.</Say>`}</Response>`);
+  }
+  res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" action="${BASE}/inbound/screen" method="POST" timeout="10" speechTimeout="auto" language="en-US">
+    <Say voice="Polly.Matthew-Neural">Hey, you reached ${bizName}. Who is calling and what is this about?</Say>
+  </Gather>
+  <Say voice="Polly.Matthew-Neural">Did not catch that. Please text us. Thanks!</Say>
+</Response>`);
+});
+
+// Inbound screener — uses mini with 10 token limit, basically free
+app.post('/inbound/screen', async (req, res) => {
+  const callerSpeech = req.body.SpeechResult || '';
+  const caller       = req.body.From || 'unknown';
+  let verdict = 'IGNORE';
+  try {
+    const decision = await openai.chat.completions.create({
+      model: CHEAP,
+      max_tokens: 5, // intentionally tiny — only need REAL_LEAD or IGNORE
+      messages: [
+        { role: 'system', content: 'Reply ONLY "REAL_LEAD" or "IGNORE". REAL_LEAD = real customer/inquiry. IGNORE = spam/unclear.' },
+        { role: 'user',   content: `Caller: "${callerSpeech.slice(0, 100)}"` },
+      ],
+    });
+    verdict = decision.choices[0].message.content.includes('REAL_LEAD') ? 'REAL_LEAD' : 'IGNORE';
+  } catch (_) { verdict = 'REAL_LEAD'; }
+
+  if (verdict === 'REAL_LEAD' && twilioClient && process.env.YOUR_REAL_NUMBER) {
+    try {
+      await twilioClient.messages.create({
+        to: process.env.YOUR_REAL_NUMBER,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        body: `🔔 NEXUS: Call from ${caller}. Said: "${callerSpeech.slice(0, 100)}". Call back if interested.`,
+      });
+    } catch (_) {}
+    return res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response><Say voice="Polly.Matthew-Neural">Got it! The team has been notified. Have a great day!</Say></Response>`);
+  }
+
+  res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response><Say voice="Polly.Matthew-Neural">Thanks for calling. Have a great day!</Say></Response>`);
+});
+
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => console.log(`Night.inc backend → port ${PORT}`));
