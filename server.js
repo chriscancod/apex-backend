@@ -28,38 +28,25 @@ async function ask(system, user, json = false, maxTokens = 1000) {
 app.get('/', (_, res) => res.json({
   status: 'NIGHT_INC_ONLINE',
   apps: ['APX', 'INDEX'],
-  routes: {
-    apx:   ['/schedule', '/fitness', '/finance/advice', '/finance/split'],
-    index: ['/ai/curriculum/build', '/ai/curriculum/chat'],
-  },
 }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// APX  —  called by AIManager.generateSchedule()  →  POST /schedule
-//
-// Swift sends:
-//   { username, tasks:[String], wakeTime, sleepTime, notes,
-//     date, currentTime, currentDay, profileContext }
-//
-// Swift decodes:
-//   APIWrapper<ScheduleResponse>
-//   → { success: Bool, data: { blocks:[ScheduleBlock], summary:String, totalXP:Int } }
-//
-// ScheduleBlock fields: time, duration, activity, category, xp
+// APX  —  POST /schedule
+// Swift: AIManager.generateSchedule() → APIWrapper<ScheduleResponse>
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/schedule', async (req, res) => {
   try {
     const {
-      username = 'OPERATOR',
-      tasks = [],
-      wakeTime = '6:30 AM',
-      sleepTime = '10:30 PM',
-      notes = '',
-      date = '',
-      currentTime = '',
-      currentDay = '',
+      username       = 'OPERATOR',
+      tasks          = [],
+      wakeTime       = '6:30 AM',
+      sleepTime      = '10:30 PM',
+      notes          = '',
+      date           = '',
+      currentTime    = '',
+      currentDay     = '',
       profileContext = '',
     } = req.body;
 
@@ -67,16 +54,27 @@ app.post('/schedule', async (req, res) => {
       ? tasks.map((t, i) => `${i + 1}. ${t}`).join('\n')
       : 'No specific tasks — build a general high-performance day.';
 
-    const profile = profileContext
-      ? `\n\nOPERATOR PROFILE:\n${profileContext}`
-      : '';
+    const profile = profileContext ? `\n\nOPERATOR PROFILE:\n${profileContext}` : '';
 
     const out = await ask(
       `You are APEX AI, a ruthlessly efficient daily scheduler for a high-performance teen operator.
 Build a time-blocked schedule using ONLY the hours between wake and sleep.
-Respect every fixed commitment listed in the profile exactly — do not move them.
-Categories must be one of: ops, fitness, study, biz, church, rest.
-Return ONLY valid JSON — no markdown, no backticks.`,
+Respect every fixed commitment listed in the profile — do not move them.
+Categories: ops, fitness, study, biz, church, rest.
+Return ONLY valid JSON — no markdown, no backticks.
+
+CRITICAL RULE — the "activity" field must be FULLY DETAILED and immediately actionable.
+NEVER write vague words like "workout", "study session", "business tasks", "rest", "morning routine".
+ALWAYS be specific:
+
+FITNESS example: "Push-ups 4x15, Pull-ups 3x8, Dips 3x12, Goblet squats 3x12 @ bodyweight, Plank 3x60s — rest 60s between sets"
+STUDY example: "Chapter 5 quadratic equations — read pp.82-94, complete exercises 5.1-5.15, mark wrong answers for review"
+BIZ example: "Write 3 product descriptions for hoodie drop, respond to 5 customer DMs, schedule 2 Instagram posts using Later"
+OPS example: "Pack gym bag (shoes, wraps, water), prep chicken + rice for tomorrow, charge AirPods + phone, wipe desk"
+REST example: "No screens. Foam roll quads + hamstrings 10 min, read 20 pages of current book, journal 3 wins from today"
+CHURCH example: "Thursday service at [location from profile] — arrive 5 min early, bring notebook"
+
+Every block must be specific enough that the operator knows EXACTLY what to do with zero guesswork.`,
 
       `Operator: ${username}
 Date: ${date} (${currentDay})
@@ -88,31 +86,31 @@ ${profile}
 Pending tasks:
 ${taskList}
 
-Return this exact JSON shape:
+Return this exact JSON:
 {
   "success": true,
   "data": {
-    "summary": "<one punchy sentence — the theme of this day>",
-    "totalXP": <sum of all block xp values>,
+    "summary": "<one punchy sentence — theme of this day>",
+    "totalXP": <sum of all block xp>,
     "blocks": [
       {
         "time": "<h:mm AM/PM>",
         "duration": "<e.g. 45 min>",
-        "activity": "<what to do — be specific>",
+        "activity": "<FULLY DETAILED — exact exercises with sets/reps, exact study topics, exact biz actions>",
         "category": "<ops|fitness|study|biz|church|rest>",
-        "xp": <number 50-300>
+        "xp": <50-300>
       }
     ]
   }
 }
 
 Rules:
-- Cover the FULL day from wake to sleep with no gaps
-- Each block must be 30-120 min
-- Total XP should be 800-2000
-- Keep activity descriptions under 80 chars`,
+- Cover FULL day from wake to sleep, no gaps
+- Each block 30-120 min
+- Total XP 800-2000
+- Activity field: be as specific as a personal trainer or coach would be`,
       true,
-      2000
+      3000
     );
 
     res.json(JSON.parse(out));
@@ -123,8 +121,7 @@ Rules:
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// APX  —  fitness plan  →  POST /apx/fitness
-// Not called by the current Swift code but kept for future use
+// APX  —  POST /apx/fitness  (future use)
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/apx/fitness', async (req, res) => {
@@ -133,7 +130,7 @@ app.post('/apx/fitness', async (req, res) => {
     const out = await ask(
       'You are APX fitness coach. Return JSON only.',
       `Goal: ${goal}  Level: ${level}  Days/week: ${days}
-JSON: { plan:[{ day, focus, exercises:[{ name, sets, reps, rest }] }] }`,
+JSON: { plan:[{ day, focus, exercises:[{ name, sets, reps, rest, notes }] }] }`,
       true, 1500
     );
     res.json(JSON.parse(out));
@@ -142,7 +139,7 @@ JSON: { plan:[{ day, focus, exercises:[{ name, sets, reps, rest }] }] }`,
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// APX  —  finance  →  POST /apx/finance/advice  &  /apx/finance/split
+// APX  —  POST /apx/finance/advice  &  /apx/finance/split
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/apx/finance/advice', async (req, res) => {
@@ -150,14 +147,13 @@ app.post('/apx/finance/advice', async (req, res) => {
     const { message = '', entries = [] } = req.body;
     const log = entries.map(e => `${e.type}: $${e.amount} (${e.label})`).join('\n');
     const reply = await ask(
-      'You are APX finance advisor for a teen entrepreneur. Be direct, practical, no fluff.',
+      'You are APX finance advisor for a teen entrepreneur. Be direct, practical, specific — give actual numbers and action steps, not generic advice.',
       `Log:\n${log || 'none'}\n\nQuestion: ${message}`
     );
     res.json({ advice: reply });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Night.inc 80/8/7/3/2 money split — pure math, no AI needed
 app.post('/apx/finance/split', (req, res) => {
   const amt = parseFloat(req.body.income) || 0;
   res.json({
@@ -174,97 +170,108 @@ app.post('/apx/finance/split', (req, res) => {
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// INDEX v5  —  curriculum build
-//
-// Swift sends (CurriculumBuildRequest):
-//   { topic, depth, style, lesson_count }
-//
-// Swift decodes (CurriculumBuildResponse):
-//   { curriculum: CurriculumPlan }
-//
-// CurriculumPlan fields (snake_case — matches Swift CodingKeys):
-//   id, topic, tagline, total_xp, earned_xp, lessons:[CurriculumLesson]
-//
-// CurriculumLesson:
-//   id, title, emoji, summary, content, key_points:[String],
-//   xp, completed, quiz_passed, quiz:[QuizQuestion]
-//
-// QuizQuestion:
-//   id, question, options:[String], correct_index, user_answer
+// INDEX v5  —  POST /ai/curriculum/build
+// Swift: CurriculumBuildRequest → CurriculumBuildResponse
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/ai/curriculum/build', async (req, res) => {
   try {
     const {
-      topic       = 'Programming',
-      depth       = 'beginner',
-      style       = 'practical',
+      topic        = 'Programming',
+      depth        = 'beginner',
+      style        = 'practical',
       lesson_count = 5,
     } = req.body;
 
     const styleGuide =
-      style === 'practical'    ? 'Focus on working code examples and hands-on exercises. Every lesson needs at least one code block.' :
-      style === 'theoretical'  ? 'Focus on concepts, mental models, and theory. Use analogies. Minimal code.' :
-                                 'Each lesson is one step toward completing a real mini-project. End with a build milestone.';
+      style === 'practical'   ? 'Every lesson must include working, runnable code examples with line-by-line explanation. Exercises must be hands-on.' :
+      style === 'theoretical' ? 'Explain the deep WHY behind every concept. Use real-world analogies. Cover history, trade-offs, mental models.' :
+                                'Each lesson is one concrete step toward a finished project. End with a deliverable the student can run or show.';
 
     const depthGuide =
-      depth === 'beginner'      ? 'Assume zero prior knowledge. Define every term on first use. Short sentences.' :
-      depth === 'intermediate'  ? 'Assume basic familiarity. Dive into mechanics, edge cases, and why things work.' :
-                                  'Assume solid foundation. Cover internals, performance, trade-offs, and advanced patterns.';
+      depth === 'beginner'     ? 'Assume zero prior knowledge. Define every term first. Use plain language. Build from absolute scratch.' :
+      depth === 'intermediate' ? 'Assume basic familiarity. Go deep on mechanics, gotchas, and edge cases. Show common mistakes and why they happen.' :
+                                 'Assume strong foundation. Cover internals, performance implications, advanced patterns, and real production concerns.';
 
     const count = Math.min(Math.max(parseInt(lesson_count) || 5, 1), 10);
 
     const out = await ask(
-      `You are INDEX, a world-class curriculum builder.
+      `You are INDEX, a world-class curriculum builder and expert teacher.
 ${styleGuide}
 ${depthGuide}
-Return ONLY valid JSON — no markdown fences, no extra text, no truncation.
-The JSON must be 100% complete and parseable.`,
+
+CRITICAL RULE — every lesson "content" field must be RICH, DETAILED, and actually teachable:
+- Never write a content field that is a single vague sentence
+- Include real explanations, actual code with comments, concrete examples
+- For code topics: show real syntax, explain each line, show output
+- For math/science: show the actual formula, walk through a worked example
+- For business/soft skills: give real frameworks, actual scripts, real scenarios
+- Key points must be genuine insights, not obvious fluff
+- Quiz questions must test real understanding, not trivia
+
+Return ONLY valid JSON — no markdown fences, no extra text, completely parseable.`,
 
       `Build a ${count}-lesson curriculum on: "${topic}"
 
-Return this EXACT JSON shape (all keys required):
+Return this EXACT JSON shape:
 {
   "curriculum": {
-    "id": "<uuid>",
+    "id": "curriculum-1",
     "topic": "${topic}",
-    "tagline": "<one punchy sentence — what the student will master>",
-    "total_xp": <sum of all lesson xp>,
+    "tagline": "<one punchy sentence — what the student will genuinely master>",
+    "total_xp": <exact sum of all lesson xp>,
     "earned_xp": 0,
     "lessons": [
       {
-        "id": "<uuid>",
-        "title": "<lesson title>",
-        "emoji": "<one emoji>",
-        "summary": "<one sentence — what this lesson covers>",
-        "content": "<lesson body in markdown — ## headers, bullet points, code blocks — max 200 words>",
-        "key_points": ["<point 1>", "<point 2>", "<point 3>"],
-        "xp": <50-200>,
+        "id": "lesson-1",
+        "title": "<specific, descriptive lesson title>",
+        "emoji": "<one relevant emoji>",
+        "summary": "<one sentence — exactly what this lesson teaches>",
+        "content": "<RICH markdown content — ## headers, bullet points, real code blocks with syntax, worked examples, explanations — 150-250 words>",
+        "key_points": [
+          "<genuine insight or rule, not obvious>",
+          "<another real takeaway>",
+          "<a third concrete thing they will know>"
+        ],
+        "xp": <75-200>,
         "completed": false,
         "quiz_passed": false,
         "quiz": [
           {
-            "id": "<uuid>",
-            "question": "<question>",
+            "id": "q-1-1",
+            "question": "<question that tests real understanding — not just recall>",
+            "options": ["<wrong but plausible>", "<correct answer>", "<wrong but plausible>", "<wrong but plausible>"],
+            "correct_index": 1,
+            "user_answer": null
+          },
+          {
+            "id": "q-1-2",
+            "question": "<different question, different concept from same lesson>",
             "options": ["<A>", "<B>", "<C>", "<D>"],
             "correct_index": <0-3>,
             "user_answer": null
           },
-          { "id": "<uuid>", "question": "...", "options": ["..."], "correct_index": 0, "user_answer": null },
-          { "id": "<uuid>", "question": "...", "options": ["..."], "correct_index": 0, "user_answer": null }
+          {
+            "id": "q-1-3",
+            "question": "<third question — practical application>",
+            "options": ["<A>", "<B>", "<C>", "<D>"],
+            "correct_index": <0-3>,
+            "user_answer": null
+          }
         ]
       }
     ]
   }
 }
 
-STRICT RULES — violating any will break the app:
-- Exactly ${count} lessons, no more, no less
+STRICT RULES:
+- Exactly ${count} lessons
 - Exactly 3 quiz questions per lesson
-- total_xp = sum of all lesson xp values
-- content max 200 words per lesson (keeps JSON small enough to complete)
-- All string values must be properly escaped JSON
-- UUIDs can be simple strings like "lesson-1", "q-1-1" etc.`,
+- total_xp = exact sum of all lesson xp values
+- Content 150-250 words (enough to be genuinely educational, short enough to complete)
+- Increment IDs: lesson-1, lesson-2... and q-1-1, q-1-2, q-1-3, q-2-1 etc.
+- correct_index must actually match the correct option in the options array
+- All JSON strings properly escaped`,
       true,
       8000
     );
@@ -277,13 +284,8 @@ STRICT RULES — violating any will break the app:
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// INDEX v5  —  lesson chat
-//
-// Swift sends (LessonChatRequest):
-//   { message, lesson_context, topic }
-//
-// Swift decodes (LessonChatResponse):
-//   { reply: String }
+// INDEX v5  —  POST /ai/curriculum/chat
+// Swift: LessonChatRequest → LessonChatResponse
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/ai/curriculum/chat', async (req, res) => {
@@ -296,17 +298,19 @@ app.post('/ai/curriculum/chat', async (req, res) => {
 
     const reply = await ask(
       `You are INDEX, an expert tutor teaching "${topic}".
-You are inside this specific lesson:
+Current lesson context:
 ${lesson_context}
 
-Rules:
-- Stay strictly on-topic for this lesson and subject
-- Be concise — 2-4 sentences max unless a code example is needed
-- Use code blocks when showing code
-- If asked something outside the lesson scope, redirect back to the lesson`,
+Be a genuinely great tutor:
+- Give detailed, accurate explanations — not one-liners
+- Show real code examples when the question is about code (with comments)
+- Walk through examples step by step
+- If the student is confused, try a different angle or analogy
+- Stay on topic for this lesson
+- Max 150 words — be thorough but concise`,
       message,
       false,
-      600
+      800
     );
 
     res.json({ reply });
