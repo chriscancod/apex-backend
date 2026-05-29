@@ -11,10 +11,10 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const PORT = process.env.PORT || 3000;
 
 // ── helper ──────────────────────────────────────────────────────────────────
-async function ask(system, user, json = false) {
+async function ask(system, user, json = false, maxTokens = 1000) {
   const res = await openai.chat.completions.create({
     model: 'gpt-4o',
-    max_tokens: 1000,
+    max_tokens: maxTokens,
     response_format: json ? { type: 'json_object' } : undefined,
     messages: [
       { role: 'system', content: system },
@@ -198,7 +198,7 @@ app.post('/ai/curriculum/build', async (req, res) => {
 
     const out = await ask(
       `You are INDEX, an expert curriculum builder. ${styleGuide} ${depthGuide}
-Return ONLY valid JSON — no markdown, no backticks, no preamble.`,
+Return ONLY valid JSON — no markdown, no backticks, no preamble. Ensure the JSON is complete and valid.`,
       `Build a ${lesson_count}-lesson curriculum on: "${topic}"
 
 Return this exact JSON shape:
@@ -234,8 +234,10 @@ Return this exact JSON shape:
   }
 }
 
-Make exactly ${lesson_count} lessons. Each lesson must have exactly 3 quiz questions. XP per lesson should be between 50-200. total_xp should equal the sum of all lesson xp values.`,
-      true
+Make exactly ${lesson_count} lessons. Each lesson must have exactly 3 quiz questions. XP per lesson should be between 50-200. total_xp should equal the sum of all lesson xp values.
+IMPORTANT: Keep each lesson "content" field under 300 words. Be concise. The JSON must be complete and valid — never truncate.`,
+      true,
+      8000
     );
 
     res.json(JSON.parse(out));
