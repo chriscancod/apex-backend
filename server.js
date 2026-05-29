@@ -11,28 +11,13 @@ app.use(express.urlencoded({ extended: true }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Twilio — only if configured
-let twilioClient = null;
-if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-  const twilio = require('twilio');
-  twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-}
+// ─── Model config ─────────────────────────────────────────────────────────────
+// gpt-4o-mini: ~33x cheaper than gpt-4o, plenty smart for all these tasks
+const MODEL = 'gpt-4o-mini';
 
-const callScripts   = {};
-const callLog       = {};
-let screenerEnabled = false;
-
-// ─── Model tiers ─────────────────────────────────────────────────────────────
-// CHEAP  = gpt-4o-mini  ~$0.00015/1K input  — used for short/simple tasks
-// NORMAL = gpt-4o-mini  same, with higher token ceiling for curriculum
-// Only use gpt-4o for things that genuinely need it (nothing here does)
-
-const CHEAP  = 'gpt-4o-mini';
-const NORMAL = 'gpt-4o-mini';
-
-async function ask(system, user, json = false, maxTokens = 500, model = CHEAP) {
+async function ask(system, user, json = false, maxTokens = 500) {
   const res = await openai.chat.completions.create({
-    model,
+    model: MODEL,
     max_tokens: maxTokens,
     response_format: json ? { type: 'json_object' } : undefined,
     messages: [
@@ -43,54 +28,28 @@ async function ask(system, user, json = false, maxTokens = 500, model = CHEAP) {
   return res.choices[0].message.content;
 }
 
-function escapeXml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
-}
-
-function requireTwilio(res) {
-  if (!twilioClient) {
-    res.status(503).json({ error: 'Twilio not configured.' });
-    return false;
-  }
-  return true;
-}
-
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/', (_, res) => res.json({
   status: 'NIGHT_INC_ONLINE',
   apps: ['APX', 'INDEX', 'NEXUS'],
-  model: CHEAP,
-  twilio: twilioClient ? 'configured' : 'not configured',
+  model: MODEL,
 }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // APX — POST /schedule
-// Switched to mini. Trimmed prompt. Cut token limit 3000→1500.
+// AIManager.generateSchedule() → APIWrapper<ScheduleResponse>
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/schedule', async (req, res) => {
   try {
     const {
-      username       = 'OPERATOR',
-      tasks          = [],
-      wakeTime       = '6:30 AM',
-      sleepTime      = '10:30 PM',
-      notes          = '',
-      date           = '',
-      currentTime    = '',
-      currentDay     = '',
-      profileContext = '',
+      username = 'OPERATOR', tasks = [], wakeTime = '6:30 AM',
+      sleepTime = '10:30 PM', notes = '', date = '',
+      currentTime = '', currentDay = '', profileContext = '',
     } = req.body;
 
-    // Trim profileContext to 300 chars max to save tokens
-    const profile = profileContext
-      ? `\nPROFILE:\n${profileContext.slice(0, 300)}`
-      : '';
-
-    // Limit tasks to 10
+    const profile  = profileContext ? `\nPROFILE:\n${profileContext.slice(0, 300)}` : '';
     const taskList = tasks.slice(0, 10).length
       ? tasks.slice(0, 10).map((t, i) => `${i + 1}. ${t}`).join('\n')
       : 'General high-performance day.';
@@ -98,28 +57,23 @@ app.post('/schedule', async (req, res) => {
     const out = await ask(
       `You are APEX AI, a daily scheduler for a high-performance teen.
 Build a time-blocked schedule between wake and sleep. Respect fixed commitments.
-Categories: ops, fitness, study, biz, church, rest.
-Return ONLY valid JSON.
+Categories: ops, fitness, study, biz, church, rest. Return ONLY valid JSON.
 
 ACTIVITY RULES — always specific, never vague:
-- fitness: "Push-ups 4x15, Pull-ups 3x8, Dips 3x12, Plank 3x60s"
+- fitness: "Push-ups 4x15, Pull-ups 3x8, Dips 3x12, Plank 3x60s — rest 60s"
 - study: "Chapter 5 — read pp.82-94, complete exercises 5.1-5.15"
 - biz: "Write 3 product descriptions, reply to 5 DMs, schedule 2 posts"
 - ops: "Pack gym bag, prep meals, charge devices, clean workspace"
 - rest: "No screens. Foam roll 10min, read 20 pages, journal 3 wins"`,
 
       `${username} | ${date} ${currentDay} | Wake:${wakeTime} Sleep:${sleepTime}
-Notes:${notes||'none'}${profile}
-Tasks:
-${taskList}
+Notes:${notes || 'none'}${profile}
+Tasks:\n${taskList}
 
-JSON:
-{"success":true,"data":{"summary":"<theme of day>","totalXP":<total>,"blocks":[{"time":"<h:mm AM/PM>","duration":"<X min>","activity":"<SPECIFIC — exact exercises/tasks>","category":"<ops|fitness|study|biz|church|rest>","xp":<50-300>}]}}
+JSON: {"success":true,"data":{"summary":"<theme>","totalXP":<total>,"blocks":[{"time":"<h:mm AM/PM>","duration":"<X min>","activity":"<SPECIFIC>","category":"<ops|fitness|study|biz|church|rest>","xp":<50-300>}]}}
 
 Rules: full day no gaps, blocks 30-120min, totalXP 800-2000, activity always specific.`,
-      true,
-      1500,
-      CHEAP
+      true, 1500
     );
 
     res.json(JSON.parse(out));
@@ -128,24 +82,7 @@ Rules: full day no gaps, blocks 30-120min, totalXP 800-2000, activity always spe
   }
 });
 
-
-// ══════════════════════════════════════════════════════════════════════════════
-// APX — finance (mini, 300 tokens max)
-// ══════════════════════════════════════════════════════════════════════════════
-
-app.post('/apx/finance/advice', async (req, res) => {
-  try {
-    const { message = '', entries = [] } = req.body;
-    const log = entries.slice(0, 10).map(e => `${e.type}: $${e.amount} (${e.label})`).join('\n');
-    const reply = await ask(
-      'APX finance advisor for a teen entrepreneur. Be direct and specific — actual numbers, real action steps. Under 100 words.',
-      `Log:\n${log||'none'}\nQuestion: ${message}`,
-      false, 300, CHEAP
-    );
-    res.json({ advice: reply });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
+// APX finance — pure math, no AI cost
 app.post('/apx/finance/split', (req, res) => {
   const amt = parseFloat(req.body.income) || 0;
   res.json({
@@ -160,41 +97,52 @@ app.post('/apx/finance/split', (req, res) => {
   });
 });
 
+app.post('/apx/finance/advice', async (req, res) => {
+  try {
+    const { message = '', entries = [] } = req.body;
+    const log = entries.slice(0, 10).map(e => `${e.type}: $${e.amount} (${e.label})`).join('\n');
+    const reply = await ask(
+      'APX finance advisor for a teen entrepreneur. Direct, specific, real numbers. Under 80 words.',
+      `Log:\n${log || 'none'}\nQuestion: ${message}`,
+      false, 300
+    );
+    res.json({ advice: reply });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 
 // ══════════════════════════════════════════════════════════════════════════════
 // INDEX — POST /ai/curriculum/build
-// Biggest cost savings: mini model + content capped at 120 words + 3000 tokens
+// CurriculumBuildRequest → CurriculumBuildResponse { curriculum: CurriculumPlan }
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/ai/curriculum/build', async (req, res) => {
   try {
     const {
-      topic        = 'Programming',
-      depth        = 'beginner',
-      style        = 'practical',
-      lesson_count = 5,
+      topic = 'Programming', depth = 'beginner',
+      style = 'practical', lesson_count = 5,
     } = req.body;
 
     const styleGuide =
-      style === 'practical'   ? 'Include real code examples with explanations.' :
-      style === 'theoretical' ? 'Focus on concepts, mental models, analogies.' :
-                                'Each lesson builds toward a real finished project.';
+      style === 'practical'   ? 'Real code examples with explanations. Hands-on exercises.' :
+      style === 'theoretical' ? 'Deep concepts, mental models, real-world analogies.' :
+                                'Each lesson = one step toward a finished project.';
 
     const depthGuide =
-      depth === 'beginner'     ? 'Assume zero prior knowledge. Plain language.' :
-      depth === 'intermediate' ? 'Assume basics. Go deeper on mechanics and edge cases.' :
-                                 'Assume strong base. Advanced patterns and production concerns.';
+      depth === 'beginner'     ? 'Zero prior knowledge. Plain language. Build from scratch.' :
+      depth === 'intermediate' ? 'Assume basics. Deeper mechanics, edge cases, common mistakes.' :
+                                 'Strong foundation assumed. Advanced patterns, production concerns.';
 
     const count = Math.min(Math.max(parseInt(lesson_count) || 5, 1), 10);
 
     const out = await ask(
       `You are INDEX, an expert curriculum builder. ${styleGuide} ${depthGuide}
 Return ONLY valid JSON — no markdown, no backticks, completely parseable.
-Keep lesson content under 120 words — dense and educational, not padded.`,
+Keep lesson content under 120 words — dense and educational.`,
 
       `Build a ${count}-lesson curriculum on: "${topic}"
 
-JSON shape (required exactly):
+JSON (required exactly):
 {
   "curriculum": {
     "id": "curriculum-1",
@@ -224,9 +172,7 @@ JSON shape (required exactly):
 }
 
 RULES: exactly ${count} lessons, exactly 3 quiz questions each, total_xp = sum of xp, IDs lesson-1/lesson-2/q-1-1/q-2-1 etc.`,
-      true,
-      4000,
-      NORMAL
+      true, 4000
     );
 
     res.json(JSON.parse(out));
@@ -235,48 +181,47 @@ RULES: exactly ${count} lessons, exactly 3 quiz questions each, total_xp = sum o
   }
 });
 
-
-// ══════════════════════════════════════════════════════════════════════════════
 // INDEX — POST /ai/curriculum/chat
-// Mini, 400 tokens max — chat doesn't need much
-// ══════════════════════════════════════════════════════════════════════════════
-
 app.post('/ai/curriculum/chat', async (req, res) => {
   try {
     const { message = '', lesson_context = '', topic = '' } = req.body;
     const reply = await ask(
-      `Expert tutor for "${topic}". Lesson: ${lesson_context.slice(0, 400)}
-Be clear, specific, use code when relevant. Max 80 words.`,
-      message,
-      false,
-      400,
-      CHEAP
+      `Expert tutor for "${topic}". Lesson: ${lesson_context.slice(0, 300)}
+Clear, specific, use code when relevant. Max 80 words.`,
+      message, false, 400
     );
     res.json({ reply });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // NEXUS — POST /api/chat
-// AIEngine.send() — AI tab, home tip, idea plans, script gen
-// Mini, 500 tokens
+// Used by: AI Tab (6 personas), Home daily tip, Idea action plans,
+//          Outreach tab AI message generation (OutreachTab.generateMessage)
+//
+// Request:  { system: string, messages: [{role, content}] }
+// Response: { reply: string }
+//
+// NOTE: NEXUS SMS uses sms:// deep links — no Twilio, no backend needed for
+// sending. The backend only generates the message text via this endpoint.
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/api/chat', async (req, res) => {
   try {
     const { system = '', messages = [] } = req.body;
 
-    // Limit conversation history to last 6 messages to save tokens
-    const history = messages.slice(-6).map(m => ({ role: m.role, content: m.content }));
+    // Cap history to last 6 messages to keep costs low
+    const history = messages.slice(-6).map(m => ({
+      role:    m.role    || 'user',
+      content: m.content || '',
+    }));
 
     const completion = await openai.chat.completions.create({
-      model: CHEAP,
+      model:      MODEL,
       max_tokens: 500,
       messages: [
-        { role: 'system', content: system.slice(0, 600) }, // cap system prompt
+        { role: 'system', content: system.slice(0, 600) },
         ...history,
       ],
     });
@@ -288,132 +233,53 @@ app.post('/api/chat', async (req, res) => {
 });
 
 
-// ══════════════════════════════════════════════════════════════════════════════
-// NEXUS AUTOMATE — Twilio endpoints (no AI cost, just Twilio cost)
-// ══════════════════════════════════════════════════════════════════════════════
-
-app.post('/call/outbound', async (req, res) => {
-  if (!requireTwilio(res)) return;
-  try {
-    const { to, name = '', script = '' } = req.body;
-    if (!to) return res.status(400).json({ error: 'Missing "to" phone number.' });
-    callScripts[to] = script || `Hello ${name||'there'}, automated message from ${process.env.BUSINESS_NAME||'our business'}. Please call us back. Thank you!`;
-    const BASE = process.env.BASE_URL || `https://localhost:${PORT}`;
-    const call = await twilioClient.calls.create({
-      to, from: process.env.TWILIO_PHONE_NUMBER,
-      url: `${BASE}/call/twiml?to=${encodeURIComponent(to)}`,
-      statusCallback: `${BASE}/call/status`,
-      statusCallbackMethod: 'POST',
-      statusCallbackEvent: ['initiated','ringing','answered','completed'],
-    });
-    callLog[call.sid] = { status: call.status, to, name, duration: 0 };
-    res.json({ callSid: call.sid, status: call.status });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/call/twiml', (req, res) => {
-  const { to = '' } = req.query;
-  const script = callScripts[to] || 'Hello, automated message. Please call us back. Thank you!';
-  res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="Polly.Matthew-Neural">${escapeXml(script)}</Say>
-  <Pause length="2"/>
-  <Say voice="Polly.Matthew-Neural">To speak with us, please call back. Have a great day!</Say>
-</Response>`);
-});
-
-app.post('/call/status', (req, res) => {
-  const { CallSid, CallStatus, CallDuration, To } = req.body;
-  if (CallSid) {
-    callLog[CallSid] = { ...(callLog[CallSid]||{}), status: CallStatus||'unknown', duration: CallDuration||0, to: To };
-    if (['completed','failed','no-answer','busy','canceled'].includes(CallStatus) && callScripts[To]) delete callScripts[To];
-  }
-  res.sendStatus(200);
-});
-
-app.get('/call/status/:sid', async (req, res) => {
-  const { sid } = req.params;
-  if (callLog[sid]) return res.json({ sid, ...callLog[sid] });
-  if (!requireTwilio(res)) return;
-  try {
-    const call = await twilioClient.calls(sid).fetch();
-    res.json({ sid, status: call.status, duration: call.duration, to: call.to });
-  } catch (e) { res.status(404).json({ error: 'Call not found', sid }); }
-});
-
-app.get('/call/queue', async (req, res) => {
-  if (!requireTwilio(res)) return;
-  try {
-    const calls = await twilioClient.calls.list({ limit: 20 });
-    res.json(calls.map(c => ({ sid: c.sid, status: c.status, to: c.to, name: callLog[c.sid]?.name||'', duration: c.duration })));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/sms/send', async (req, res) => {
-  if (!requireTwilio(res)) return;
-  try {
-    const { to, message } = req.body;
-    if (!to || !message) return res.status(400).json({ error: 'Missing "to" or "message".' });
-    const msg = await twilioClient.messages.create({ to, from: process.env.TWILIO_PHONE_NUMBER, body: message });
-    res.json({ smsSid: msg.sid, status: msg.status });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/inbound/config', (req, res) => {
-  screenerEnabled = Boolean(req.body.enabled);
-  res.json({ enabled: screenerEnabled });
-});
-
-app.post('/inbound/voice', (req, res) => {
-  const BASE    = process.env.BASE_URL || `https://localhost:${PORT}`;
-  const bizName = escapeXml(process.env.BUSINESS_NAME || 'our business');
-  if (!screenerEnabled) {
-    const real = process.env.YOUR_REAL_NUMBER;
-    return res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>${real ? `<Dial>${escapeXml(real)}</Dial>` : `<Say voice="Polly.Matthew-Neural">Thanks for calling ${bizName}. Please call back or text us.</Say>`}</Response>`);
-  }
-  res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Gather input="speech" action="${BASE}/inbound/screen" method="POST" timeout="10" speechTimeout="auto" language="en-US">
-    <Say voice="Polly.Matthew-Neural">Hey, you reached ${bizName}. Who is calling and what is this about?</Say>
-  </Gather>
-  <Say voice="Polly.Matthew-Neural">Did not catch that. Please text us. Thanks!</Say>
-</Response>`);
-});
-
-// Inbound screener — uses mini with 10 token limit, basically free
-app.post('/inbound/screen', async (req, res) => {
-  const callerSpeech = req.body.SpeechResult || '';
-  const caller       = req.body.From || 'unknown';
-  let verdict = 'IGNORE';
-  try {
-    const decision = await openai.chat.completions.create({
-      model: CHEAP,
-      max_tokens: 5, // intentionally tiny — only need REAL_LEAD or IGNORE
-      messages: [
-        { role: 'system', content: 'Reply ONLY "REAL_LEAD" or "IGNORE". REAL_LEAD = real customer/inquiry. IGNORE = spam/unclear.' },
-        { role: 'user',   content: `Caller: "${callerSpeech.slice(0, 100)}"` },
-      ],
-    });
-    verdict = decision.choices[0].message.content.includes('REAL_LEAD') ? 'REAL_LEAD' : 'IGNORE';
-  } catch (_) { verdict = 'REAL_LEAD'; }
-
-  if (verdict === 'REAL_LEAD' && twilioClient && process.env.YOUR_REAL_NUMBER) {
-    try {
-      await twilioClient.messages.create({
-        to: process.env.YOUR_REAL_NUMBER,
-        from: process.env.TWILIO_PHONE_NUMBER,
-        body: `🔔 NEXUS: Call from ${caller}. Said: "${callerSpeech.slice(0, 100)}". Call back if interested.`,
-      });
-    } catch (_) {}
-    return res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response><Say voice="Polly.Matthew-Neural">Got it! The team has been notified. Have a great day!</Say></Response>`);
-  }
-
-  res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
-<Response><Say voice="Polly.Matthew-Neural">Thanks for calling. Have a great day!</Say></Response>`);
-});
-
-
 // ─── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => console.log(`Night.inc backend → port ${PORT}`));
+app.listen(PORT, () => console.log(`Night.inc backend → port ${PORT} | model: ${MODEL}`));
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WARDROBE — POST /api/outfits
+// AIOutfitEngine posts closet items → get outfit combinations back
+// Request:  { items: [{name, color, type, style}], occasion?, weather? }
+// Response: { outfits: [{name, pieces, vibe, confidence}] }
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.post('/api/outfits', async (req, res) => {
+  try {
+    const { items = [], occasion = 'casual', weather = 'mild' } = req.body;
+
+    if (!items.length) return res.status(400).json({ error: 'No items provided.' });
+
+    const itemList = items.slice(0, 30)
+      .map((it, i) => `${i + 1}. ${it.name} — ${it.color}, ${it.type}, ${it.style || 'unspecified style'}`)
+      .join('\n');
+
+    const out = await ask(
+      `You are a fashion AI for a dark luxury streetwear brand. 
+Build outfit combinations from the user's closet. Be specific about pieces and why they work together.
+Return ONLY valid JSON.`,
+
+      `Occasion: ${occasion}. Weather: ${weather}.
+Closet items:
+${itemList}
+
+JSON: {"outfits":[{"name":"<outfit name>","pieces":["<item>","<item>","<item>"],"vibe":"<1 sentence>","confidence":<0.0-1.0>}]}
+
+Rules: 3-5 outfits, 2-4 pieces each, only use items from the list above, confidence reflects how well pieces match.`,
+      true, 1000
+    );
+
+    res.json(JSON.parse(out));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// KINETIC / AURA / DECK — POST /api/chat already handles these.
+// All three apps post { system, messages } → { reply }
+// KINETIC: workout plans, biometric analysis
+// AURA: skincare routines, product recommendations
+// DECK: podcast summaries, AI recommendations
+// No separate routes needed — /api/chat is generic enough.
+// ══════════════════════════════════════════════════════════════════════════════
