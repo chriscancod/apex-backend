@@ -448,50 +448,80 @@ app.post('/api/chat', requireAuth, aiLimiter, async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // WARDROBE — POST /api/outfits
+//
+// Returns ONE outfit per call. Always a new combo.
+// Accepts: items[], occasion, weather, notes (user comment), previousCombos[]
+// previousCombos = array of piece-name arrays the user already saw today
+// so the AI never repeats the same combo.
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
   const t0 = Date.now();
   try {
-    const items     = Array.isArray(req.body.items) ? req.body.items.slice(0, 30) : [];
-    const occasion  = strShort(req.body.occasion, 'casual');
-    const weather   = strShort(req.body.weather,  'mild');
-    const randomize = Boolean(req.body.randomize);
+    const items          = Array.isArray(req.body.items) ? req.body.items.slice(0, 50) : [];
+    const occasion       = strShort(req.body.occasion, 'casual');
+    const weather        = strShort(req.body.weather,  'mild');
+    const notes          = strShort(req.body.notes,    '');   // user's comment/vibe note
+    const previousCombos = Array.isArray(req.body.previousCombos)
+      ? req.body.previousCombos.slice(0, 10)
+      : [];
 
     if (!items.length) return res.status(400).json({ error: 'No items provided.' });
 
-    // Free randomizer — zero AI cost
-    if (randomize) {
-      const shuffled = [...items].sort(() => Math.random() - 0.5);
-      const picks    = shuffled.slice(0, Math.min(3, shuffled.length));
-      return res.json({
-        outfits: [{
-          name:         'RANDOM FIT',
-          pieces:       picks.map(p => (typeof p === 'object' ? p.name : String(p))),
-          vibe:         'Randomized pick — style it your way.',
-          why_it_works: 'Random selection from your closet.',
-          confidence:   0.7,
-        }],
-        source: 'randomizer',
-      });
-    }
-
+    // Build item list
     const itemList = items
       .map((it, i) => {
         const name  = typeof it === 'object' ? (it.name  || 'unknown') : String(it);
-        const color = typeof it === 'object' ? (it.color || 'unknown') : '';
-        const type  = typeof it === 'object' ? (it.type  || 'unknown') : '';
+        const color = typeof it === 'object' ? (it.color || '')        : '';
+        const type  = typeof it === 'object' ? (it.type  || '')        : '';
         const style = typeof it === 'object' ? (it.style || '')        : '';
-        return `${i + 1}. ${name}${color ? ` (${color}` : ''}${type ? `, ${type}` : ''}${style ? `, ${style}` : ''}${color ? ')' : ''}`;
+        const parts = [color, type, style].filter(Boolean).join(', ');
+        return `${i + 1}. ${name}${parts ? ` (${parts})` : ''}`;
       })
       .join('\n');
 
+    // Tell the AI what combos to avoid
+    const avoidBlock = previousCombos.length
+      ? `\nAVOID — do not repeat these combos the user already saw:\n${previousCombos.map((c, i) => `${i + 1}. ${Array.isArray(c) ? c.join(' + ') : c}`).join('\n')}`
+      : '';
+
+    // Inject randomness so the AI doesn't default to the same "safe" pick
+    const randomSeed = ['bold', 'minimal', 'layered', 'monochrome', 'contrast', 'streetwear-forward', 'clean', 'oversized'][Math.floor(Math.random() * 8)];
+
     const out = await ask(
-      `You are a fashion AI for Night.inc — a dark luxury streetwear brand (NOCTIS/2AM aesthetic).
-Build outfit combinations from the user's closet. Be specific about why pieces work — color theory, silhouette, occasion.
+      `You are a fashion AI — an expert stylist who knows color theory, silhouette, and streetwear culture.
+Your job: pick ONE great outfit from the user's closet for the occasion and weather given.
+Every time you are called you must pick a DIFFERENT combination — explore the closet creatively.
+Think like a stylist, not an algorithm — consider mood, layering, proportion, and color harmony.
 Return ONLY valid JSON.`,
-      `Occasion: ${occasion}. Weather: ${weather}.\nCloset:\n${itemList}\n\nJSON:\n{"outfits":[{"name":"<creative name>","pieces":["<item>","<item>","<item>"],"vibe":"<one sentence>","why_it_works":"<color/silhouette logic>","confidence":<0.0-1.0>}],"source":"ai"}\n\nRules: 3-5 outfits, 2-4 pieces each, only items from the list, confidence = how well they match.`,
-      true, 1200, FAST
+
+      `Occasion: ${occasion}
+Weather: ${weather}
+Style direction for this pick: ${randomSeed}
+${notes ? `User note: "${notes}"` : ''}
+${avoidBlock}
+
+Closet:
+${itemList}
+
+Pick ONE outfit. Return this exact JSON:
+{
+  "outfit": {
+    "name": "<creative outfit name — 2-4 words, fits the vibe>",
+    "pieces": ["<exact item name from closet>", "<exact item name>", "<exact item name>"],
+    "vibe": "<one sentence — the mood or look this creates>",
+    "why_it_works": "<one sentence — specific color/silhouette/occasion reasoning>",
+    "stylist_tip": "<one actionable tip — how to wear it, what to do with the fit, shoes, accessories>",
+    "confidence": <0.7-1.0>
+  }
+}
+
+Rules:
+- Only use items that exist in the closet list above
+- 2-4 pieces maximum
+- Must be a different combo from any in the AVOID list
+- Be creative — do not always default to the most obvious combination`,
+      true, 600, FAST
     );
 
     let parsed;
@@ -499,7 +529,7 @@ Return ONLY valid JSON.`,
     catch { return res.status(502).json({ error: 'AI returned invalid response. Please try again.' }); }
 
     log('/api/outfits', 200, Date.now() - t0);
-    res.json(parsed);
+    res.json({ ...parsed, source: 'ai' });
 
   } catch (e) {
     log('/api/outfits', 500, Date.now() - t0, e.message);
