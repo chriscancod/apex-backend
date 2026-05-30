@@ -1,25 +1,74 @@
 require('dotenv').config();
-const express = require('express');
-const cors    = require('cors');
-const OpenAI  = require('openai');
+const express    = require('express');
+const cors       = require('cors');
+const OpenAI     = require('openai');
+const rateLimit  = require('express-rate-limit');
+const helmet     = require('helmet');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// ─── Security headers ─────────────────────────────────────────────────────────
+app.use(helmet());
+app.use(cors({
+  origin: '*', // tighten to your app bundle ID in v2
+  methods: ['GET', 'POST'],
+}));
+app.use(express.json({ limit: '50kb' })); // hard cap — no giant payloads
+app.use(express.urlencoded({ extended: true, limit: '50kb' }));
 
-// ─── Model tiers ──────────────────────────────────────────────────────────────
-// FAST  = gpt-4.1-mini  — short chat, quick replies, simple tasks
-// SMART = gpt-4.1-mini  — curriculum builds, schedules (higher token ceiling)
-// Quality fix: the issue was token limits cutting responses mid-thought.
-// Raising limits on the routes that need full output.
+// ─── OpenAI ───────────────────────────────────────────────────────────────────
+if (!process.env.OPENAI_API_KEY) {
+  console.error('FATAL: OPENAI_API_KEY not set');
+  process.exit(1);
+}
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  timeout: 45000, // 45s max — don't let OpenAI hang forever
+  maxRetries: 2,
+});
 
-const FAST  = 'gpt-4.1-mini';
-const SMART = 'gpt-4.1-mini';
+// ─── Optional API key auth ────────────────────────────────────────────────────
+// Set APP_SECRET in Railway env vars. Apps send it as x-app-secret header.
+// If not set, auth is skipped (dev mode). Set it before going live.
+const APP_SECRET = process.env.APP_SECRET || null;
 
+function requireAuth(req, res, next) {
+  if (!APP_SECRET) return next(); // dev mode — no secret set
+  const secret = req.headers['x-app-secret'];
+  if (!secret || secret !== APP_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized.' });
+  }
+  next();
+}
+
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+// Global: 200 requests per IP per 15 minutes
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please slow down.' },
+});
+
+// AI routes: tighter — 30 per IP per 15 minutes
+// Prevents one user from draining your OpenAI balance
+const aiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'AI request limit reached. Try again in a few minutes.' },
+});
+
+app.use(globalLimiter);
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+const FAST  = 'gpt-4.1-mini'; // chat, quick replies, outfits
+const SMART = 'gpt-4.1-mini'; // schedules, curriculum — higher token ceiling
+
+// ─── Core AI call ─────────────────────────────────────────────────────────────
 async function ask(system, user, json = false, maxTokens = 800, model = FAST) {
   const res = await openai.chat.completions.create({
     model,
@@ -27,98 +76,177 @@ async function ask(system, user, json = false, maxTokens = 800, model = FAST) {
     response_format: json ? { type: 'json_object' } : undefined,
     messages: [
       { role: 'system', content: system },
-      { role: 'user',   content: user  },
+      { role: 'user',   content: user   },
     ],
   });
   return res.choices[0].message.content;
 }
 
+// ─── Input helpers ────────────────────────────────────────────────────────────
+function str(val, fallback = '') {
+  if (typeof val !== 'string') return fallback;
+  return val.trim().slice(0, 2000); // hard cap per field
+}
+function strShort(val, fallback = '') {
+  if (typeof val !== 'string') return fallback;
+  return val.trim().slice(0, 200);
+}
+function safeArray(val, limit = 20) {
+  if (!Array.isArray(val)) return [];
+  return val.slice(0, limit).map(i => String(i).trim().slice(0, 200));
+}
+
+// ─── Logging ─────────────────────────────────────────────────────────────────
+function log(route, status, ms, extra = '') {
+  console.log(`[${new Date().toISOString()}] ${route} ${status} ${ms}ms ${extra}`);
+}
+
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/', (_, res) => res.json({
   status: 'NIGHT_INC_ONLINE',
+  version: '3.0.0',
   apps: ['APX','INDEX','NEXUS','KINETIC','AURA','DECK','WARDROBE'],
-  model: 'gpt-4.1-mini',
 }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // APX — POST /schedule
-//
-// FIX: Was cutting off mid-schedule at 1500 tokens.
-// Raised to 2500. Tightened prompt to spend tokens on BLOCKS not padding.
-// Added explicit "never truncate" instruction and minimum block count rule.
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.post('/schedule', async (req, res) => {
+app.post('/schedule', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
   try {
-    const {
-      username = 'OPERATOR', tasks = [], wakeTime = '6:30 AM',
-      sleepTime = '10:30 PM', notes = '', date = '',
-      currentTime = '', currentDay = '', profileContext = '',
-    } = req.body;
+    const username    = strShort(req.body.username,    'OPERATOR');
+    const tasks       = safeArray(req.body.tasks, 12);
+    const wakeTime    = strShort(req.body.wakeTime,    '6:30 AM');
+    const sleepTime   = strShort(req.body.sleepTime,   '10:30 PM');
+    const notes       = strShort(req.body.notes,       '');
+    const date        = strShort(req.body.date,        '');
+    const currentTime = strShort(req.body.currentTime, '');
+    const currentDay  = strShort(req.body.currentDay,  '');
 
-    const profile  = profileContext ? `\nPROFILE:\n${profileContext.slice(0, 400)}` : '';
-    const taskList = tasks.slice(0, 12).length
-      ? tasks.slice(0, 12).map((t, i) => `${i + 1}. ${t}`).join('\n')
+    // Profile — accept structured fields or full protocol blob (no slicing)
+    const profileAge          = strShort(req.body.profileAge,          '');
+    const profileSchool       = strShort(req.body.profileSchool,       '');
+    const profileSports       = strShort(req.body.profileSports,       '');
+    const profilePracticeDays = strShort(req.body.profilePracticeDays, '');
+    const profilePracticeTime = strShort(req.body.profilePracticeTime, '');
+    const profileBusiness     = strShort(req.body.profileBusiness,     '');
+    const profileGoals        = strShort(req.body.profileGoals,        '');
+    const profileOther        = strShort(req.body.profileOther,        '');
+    const profileSchedule     = str(req.body.profileSchedule,          ''); // full protocol — no cap
+    const profileContext      = str(req.body.profileContext,           ''); // fallback blob
+
+    const taskList = tasks.length
+      ? tasks.map((t, i) => `${i + 1}. ${t}`).join('\n')
       : 'General high-performance day.';
 
-    // Estimate hours available to set block count expectation
+    // Build constraints block
+    const constraints = [];
+    if (profileSchedule)
+      constraints.push(`BATMAN PROTOCOL / FIXED SCHEDULE (use exact times for ${currentDay}):\n${profileSchedule}`);
+    else if (profileContext)
+      constraints.push(`PROFILE & SCHEDULE:\n${profileContext}`);
+
+    if (profilePracticeDays && profilePracticeTime)
+      constraints.push(`PRACTICE: ${profilePracticeDays} at ${profilePracticeTime} — NON-NEGOTIABLE`);
+
+    const fixedBlock = constraints.length
+      ? `⚠️ FIXED CONSTRAINTS — respect exactly:\n${constraints.join('\n\n')}\n`
+      : '';
+
+    const personalLines = [
+      profileAge      && `Age: ${profileAge}`,
+      profileSchool   && `School: ${profileSchool}`,
+      profileSports   && `Sports: ${profileSports}`,
+      profileBusiness && `Business: ${profileBusiness}`,
+      profileGoals    && `Goals: ${profileGoals}`,
+      profileOther    && `Other: ${profileOther}`,
+    ].filter(Boolean).join(' | ');
+
     const out = await ask(
-      `You are APEX AI — elite daily scheduler for a high-performance teen founder.
-Build a COMPLETE time-blocked schedule from wake to sleep. Every hour must be accounted for. No gaps. No truncation.
+      `You are APEX AI — an elite daily scheduler for high-performance people of any age, background, or lifestyle.
+
+Your job: read the user's profile, fixed schedule, and tasks — then build the best possible day around their real life.
+
+HOW TO READ THE CONTEXT:
+• If a fixed schedule is provided (class times, work shifts, practice, church, recurring commitments) — treat those as NON-NEGOTIABLE. Build everything else around them.
+• If sports or training is listed — include a workout block with specifics matching their sport/fitness level.
+• If a business or project is listed — include focused work blocks for it.
+• If a sleep time is set — that is the hard stop. Nothing after it.
+• If goals are listed — every day should move toward at least one of them.
+• Respect the user's actual life. A student has school. An athlete has practice. A founder has brand work. Read what they gave you and use it.
+
+RULES:
+1. Fixed commitments are sacred — never schedule over them
+2. Fill EVERY hour from wake to sleep — zero gaps, zero truncation
+3. Activities must be SPECIFIC — exact exercises/sets/reps, exact tasks, exact actions. Never vague.
+4. Minimum 8 blocks, as many as needed to cover the full day
+5. Return ONLY valid JSON — complete every block, never stop early
 
 CATEGORIES: ops, fitness, study, biz, church, rest
 
-ACTIVITY RULES — always specific, never vague:
-• fitness → exact exercises, sets, reps, rest periods. E.g. "Push-ups 4×15, Pull-ups 3×8, Dips 3×12, Plank 3×60s — rest 60s between sets"
-• study   → exact chapter/page range + exercises. E.g. "Algebra Ch.7 pp.142-158, complete exercises 7.1–7.20"
-• biz     → exact actions. E.g. "Draft 3 product descriptions, respond to 5 Instagram DMs, schedule 2 TikTok posts"
-• ops     → exact prep. E.g. "Pack gym bag, meal prep lunch, charge all devices, clean desk"
-• rest    → no screens. E.g. "Foam roll 15min, read 20 pages, journal 3 wins + 1 lesson"
-
-CRITICAL: You MUST fill the ENTIRE day. Generate as many blocks as needed to cover wake→sleep with zero gaps.
-Return ONLY valid JSON. Do NOT stop early. Do NOT truncate.`,
+ACTIVITY SPECIFICITY — always this level of detail:
+• fitness → match their sport/training. E.g. "Squats 4×12, Romanian deadlifts 3×10, Calf raises 3×20, Core: Plank 3×45s"
+• study   → exact subject and task. E.g. "AP Chemistry Ch.8 — read pp.201-218, complete practice problems 8.1-8.12"
+• biz     → exact actions. E.g. "Write 3 product descriptions, respond to 5 customer DMs, schedule 2 social posts"
+• ops     → exact prep. E.g. "Pack bag, prep meals, charge devices, lay out tomorrow's outfit"
+• rest    → no screens, active recovery. E.g. "Foam roll legs/back 10min, read 20 pages, journal 3 wins"`,
 
       `OPERATOR: ${username}
-DATE: ${date} ${currentDay}
+DATE: ${date} ${currentDay} | NOW: ${currentTime}
 WAKE: ${wakeTime} → SLEEP: ${sleepTime}
-CURRENT TIME: ${currentTime}
-NOTES: ${notes || 'none'}${profile}
+${personalLines ? `ABOUT: ${personalLines}` : ''}
 
-TASKS TO SCHEDULE:
+${fixedBlock}
+NOTES: ${notes || 'none'}
+
+TASKS TO FIT IN TODAY:
 ${taskList}
 
-Return this exact JSON (fill ALL hours, minimum 8 blocks, maximum 20):
+JSON (cover every hour ${wakeTime}→${sleepTime}, min 8 blocks):
 {
   "success": true,
   "data": {
-    "summary": "<theme of day — one punchy sentence>",
-    "totalXP": <sum of all block XP>,
+    "summary": "<one punchy sentence about today's theme>",
+    "totalXP": <sum of all block xp>,
     "blocks": [
       {
         "time": "<h:mm AM/PM>",
         "duration": "<X min>",
-        "activity": "<SPECIFIC — exact exercises / chapter numbers / exact actions>",
+        "activity": "<SPECIFIC>",
         "category": "<ops|fitness|study|biz|church|rest>",
         "xp": <50-300>
       }
     ]
   }
-}
-
-Rules: blocks 30–120min, totalXP 1000–2500, cover every hour from ${wakeTime} to ${sleepTime}.`,
+}`,
       true, 2500, SMART
     );
 
-    res.json(JSON.parse(out));
+    let parsed;
+    try { parsed = JSON.parse(out); }
+    catch { return res.status(502).json({ success: false, data: null, error: 'AI returned invalid response. Please try again.' }); }
+
+    log('/schedule', 200, Date.now() - t0, `blocks=${parsed?.data?.blocks?.length ?? 0}`);
+    res.json(parsed);
+
   } catch (e) {
-    res.status(500).json({ success: false, data: null, error: e.message });
+    log('/schedule', 500, Date.now() - t0, e.message);
+    res.status(500).json({ success: false, data: null, error: 'Schedule generation failed. Please try again.' });
   }
 });
 
-// APX finance — pure math, free
-app.post('/apx/finance/split', (req, res) => {
-  const amt = parseFloat(req.body.income) || 0;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// APX — Finance (pure math, no AI)
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.post('/apx/finance/split', requireAuth, (req, res) => {
+  const amt = parseFloat(req.body.income);
+  if (isNaN(amt) || amt < 0 || amt > 1_000_000) {
+    return res.status(400).json({ error: 'Invalid income value.' });
+  }
   res.json({
     total: amt,
     split: {
@@ -131,259 +259,268 @@ app.post('/apx/finance/split', (req, res) => {
   });
 });
 
-app.post('/apx/finance/advice', async (req, res) => {
+app.post('/apx/finance/advice', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
   try {
-    const { message = '', entries = [] } = req.body;
-    const log = entries.slice(0, 10).map(e => `${e.type}: $${e.amount} (${e.label})`).join('\n');
+    const message = strShort(req.body.message, '');
+    const entries = safeArray(req.body.entries, 10)
+      .map(e => (typeof e === 'object' ? `${e.type}: $${e.amount} (${e.label})` : String(e)));
+
+    if (!message) return res.status(400).json({ error: 'Message is required.' });
+
     const reply = await ask(
-      'APX finance advisor for a teen entrepreneur. Direct, specific, real numbers and formulas. Max 120 words.',
-      `Log:\n${log || 'none'}\nQuestion: ${message}`,
+      'APX finance advisor for a teen entrepreneur. Direct, specific, real numbers. Max 120 words.',
+      `Log:\n${entries.join('\n') || 'none'}\nQuestion: ${message}`,
       false, 400, FAST
     );
+    log('/apx/finance/advice', 200, Date.now() - t0);
     res.json({ advice: reply });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    log('/apx/finance/advice', 500, Date.now() - t0, e.message);
+    res.status(500).json({ error: 'Finance advice unavailable. Please try again.' });
+  }
 });
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // INDEX — POST /ai/curriculum/build
-//
-// FIX: Lessons were thin — "buns, no real pizzazz."
-// Root cause: 120-word cap + 4000 token ceiling = AI had to compress hard.
-// Fix: Raised to 6000 tokens. Removed word cap. Added explicit quality rules.
-// Added personality instructions — lessons should feel like a great teacher
-// explaining to a smart 16-year-old, not a Wikipedia article.
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.post('/ai/curriculum/build', async (req, res) => {
+app.post('/ai/curriculum/build', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
   try {
-    const {
-      topic = 'Programming', depth = 'beginner',
-      style = 'practical', lesson_count = 5,
-    } = req.body;
+    const topic  = strShort(req.body.topic,  'Programming');
+    const depth  = strShort(req.body.depth,  'beginner');
+    const style  = strShort(req.body.style,  'practical');
+    const count  = Math.min(Math.max(parseInt(req.body.lesson_count) || 5, 1), 10);
+
+    if (!topic) return res.status(400).json({ error: 'Topic is required.' });
+
+    const validDepths = ['beginner', 'intermediate', 'advanced'];
+    const validStyles = ['practical', 'theoretical', 'project'];
+    const safeDepth   = validDepths.includes(depth) ? depth : 'beginner';
+    const safeStyle   = validStyles.includes(style) ? style : 'practical';
 
     const styleGuide =
-      style === 'practical'   ? 'Lead with real working code examples. Explain every line. Show what happens when it runs.' :
-      style === 'theoretical' ? 'Build intuition first. Use sharp analogies. Then formalize the concept.' :
-                                'Every lesson = one concrete step toward a finished project. Student should have something working by the end.';
+      safeStyle === 'practical'   ? 'Lead with real working code/examples. Explain every step. Show what happens when it runs.' :
+      safeStyle === 'theoretical' ? 'Build intuition first with sharp analogies. Then formalize. Concepts before syntax.' :
+                                    'Every lesson = one concrete step toward a finished project. Student should have something working by the end.';
 
     const depthGuide =
-      depth === 'beginner'     ? 'Assume zero prior knowledge. Use plain language. Build from absolute scratch. No jargon without explanation.' :
-      depth === 'intermediate' ? 'Assume basics are solid. Go deep on mechanics, edge cases, and common mistakes pros make.' :
-                                 'Assume strong foundation. Cover advanced patterns, performance concerns, and production-level thinking.';
-
-    const count = Math.min(Math.max(parseInt(lesson_count) || 5, 1), 10);
+      safeDepth === 'beginner'     ? 'Zero prior knowledge assumed. Plain language. Build from scratch. No jargon without explanation.' :
+      safeDepth === 'intermediate' ? 'Basics assumed. Go deep on mechanics, edge cases, and mistakes pros make.' :
+                                     'Strong foundation assumed. Advanced patterns, performance, production-level thinking.';
 
     const out = await ask(
-      `You are INDEX — an elite curriculum builder and teacher. ${styleGuide} ${depthGuide}
+      `You are INDEX — an elite curriculum builder. ${styleGuide} ${depthGuide}
 
 LESSON QUALITY STANDARDS:
-• Write like a brilliant mentor explaining to a sharp 16-year-old who learns fast
-• Each lesson must have a clear "aha moment" — the one insight that changes how they think
-• Use real examples, real code, real analogies — not textbook filler
-• content field: write 200-350 words of rich markdown. Use ## headers, bullet points, and code blocks where helpful
-• key_points: 3 genuinely insightful takeaways — not obvious restatements
-• Quiz questions must test real understanding, not just memorization
-• Make it feel like the best class the student ever took
+• Write like a brilliant mentor to a sharp 16-year-old who learns fast
+• Each lesson needs one clear "aha moment" — the insight that changes how they think
+• Use real examples, real code, real analogies — never textbook filler
+• content: 200-350 words of rich markdown — ## headers, bullets, code blocks
+• key_points: 3 genuine insights — not restatements of the lesson title
+• Quiz questions must test real understanding, not memorization
+• Make it feel like the best class they ever took
 
-Return ONLY valid JSON — no markdown, no backticks, completely parseable.`,
+Return ONLY valid JSON — no markdown fences, completely parseable. Complete all lessons fully.`,
 
       `Build a ${count}-lesson curriculum on: "${topic}"
 
-REQUIRED JSON shape (fill every field completely):
+JSON:
 {
   "curriculum": {
     "id": "curriculum-1",
     "topic": "${topic}",
-    "tagline": "<what the student will be able to DO after this curriculum — specific and exciting>",
-    "total_xp": <sum of all lesson xp>,
+    "tagline": "<what the student will be able to DO — specific and exciting>",
+    "total_xp": <sum of lesson xp>,
     "earned_xp": 0,
     "lessons": [
       {
         "id": "lesson-1",
-        "title": "<compelling title — not just 'Introduction'>",
-        "emoji": "<relevant emoji>",
-        "summary": "<one sentence that makes them want to read — hint at the aha moment>",
-        "content": "<rich markdown 200-350 words: ## headers, bullet points, code blocks, real examples — make it excellent>",
-        "key_points": [
-          "<genuine insight #1 — something that shifts their thinking>",
-          "<genuine insight #2 — practical or counterintuitive>",
-          "<genuine insight #3 — connects to the bigger picture>"
-        ],
+        "title": "<compelling title>",
+        "emoji": "<emoji>",
+        "summary": "<one sentence that hints at the aha moment>",
+        "content": "<rich markdown 200-350 words>",
+        "key_points": ["<real insight>", "<real insight>", "<real insight>"],
         "xp": <100-200>,
         "completed": false,
         "quiz_passed": false,
         "quiz": [
-          {
-            "id": "q-1-1",
-            "question": "<question that tests real understanding, not trivia>",
-            "options": ["<wrong but plausible>", "<correct answer>", "<wrong but plausible>", "<wrong but plausible>"],
-            "correct_index": 1,
-            "user_answer": null
-          },
-          {
-            "id": "q-1-2",
-            "question": "<different concept from same lesson>",
-            "options": ["<A>", "<B>", "<C>", "<D>"],
-            "correct_index": <0-3>,
-            "user_answer": null
-          },
-          {
-            "id": "q-1-3",
-            "question": "<practical application — what would you do in this situation?>",
-            "options": ["<A>", "<B>", "<C>", "<D>"],
-            "correct_index": <0-3>,
-            "user_answer": null
-          }
+          {"id":"q-1-1","question":"<tests real understanding>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},
+          {"id":"q-1-2","question":"<different concept>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},
+          {"id":"q-1-3","question":"<practical application>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null}
         ]
       }
     ]
   }
 }
 
-RULES:
-- Exactly ${count} lessons
-- Exactly 3 quiz questions per lesson
-- total_xp = sum of all lesson xp values
-- Lesson IDs: lesson-1, lesson-2... Quiz IDs: q-1-1, q-1-2, q-1-3, q-2-1...
-- DO NOT truncate. Complete all ${count} lessons fully.`,
+RULES: exactly ${count} lessons, exactly 3 quiz questions each, total_xp = sum of xp, IDs lesson-1/lesson-2/q-1-1/q-2-1 etc. Do NOT truncate.`,
       true, 6000, SMART
     );
 
-    res.json(JSON.parse(out));
+    let parsed;
+    try { parsed = JSON.parse(out); }
+    catch { return res.status(502).json({ error: 'AI returned invalid curriculum. Please try again.' }); }
+
+    log('/ai/curriculum/build', 200, Date.now() - t0, `lessons=${parsed?.curriculum?.lessons?.length ?? 0}`);
+    res.json(parsed);
+
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    log('/ai/curriculum/build', 500, Date.now() - t0, e.message);
+    res.status(500).json({ error: 'Curriculum build failed. Please try again.' });
   }
 });
 
-// INDEX — POST /ai/curriculum/chat
-// FIX: Was 400 tokens — tutor was cutting off mid-explanation.
-// Raised to 600. Added personality — sharp, real, like a good mentor.
-app.post('/ai/curriculum/chat', async (req, res) => {
-  try {
-    const { message = '', lesson_context = '', topic = '' } = req.body;
-    const reply = await ask(
-      `You are INDEX AI — a sharp, direct tutor for the topic "${topic}".
-Current lesson context: ${lesson_context.slice(0, 500)}
 
-Be like the smartest person you know explaining something — clear, specific, no fluff.
-Use code examples when they help. Use analogies when abstract. Max 150 words but use them well.
-Never end mid-sentence. Complete every thought.`,
+// ══════════════════════════════════════════════════════════════════════════════
+// INDEX — POST /ai/curriculum/chat
+// ══════════════════════════════════════════════════════════════════════════════
+
+app.post('/ai/curriculum/chat', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const message        = strShort(req.body.message, '');
+    const lesson_context = str(req.body.lesson_context, '').slice(0, 600);
+    const topic          = strShort(req.body.topic, '');
+
+    if (!message) return res.status(400).json({ error: 'Message is required.' });
+
+    const reply = await ask(
+      `You are INDEX AI — a sharp, direct tutor for "${topic}".
+Lesson context: ${lesson_context}
+Be clear and specific. Use code or analogies when helpful. Max 150 words. Never cut off mid-sentence.`,
       message,
       false, 600, FAST
     );
+    log('/ai/curriculum/chat', 200, Date.now() - t0);
     res.json({ reply });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    log('/ai/curriculum/chat', 500, Date.now() - t0, e.message);
+    res.status(500).json({ error: 'Tutor unavailable. Please try again.' });
+  }
 });
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // NEXUS — POST /api/chat
-//
-// FIX: Was tapping out at 500 tokens — AI personas were giving half-answers.
-// Raised to 800. History still capped at 6 messages to control cost.
-// Added instruction to never cut off mid-thought.
+// Used by: AI tab (6 personas), home tip, idea plans, outreach message gen
+// Also used by KINETIC, AURA, DECK (all send {system, messages})
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
   try {
-    const { system = '', messages = [] } = req.body;
+    const system   = str(req.body.system, '').slice(0, 800);
+    const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
 
-    const history = messages.slice(-6).map(m => ({
-      role:    m.role    || 'user',
-      content: m.content || '',
-    }));
+    if (!messages.length) return res.status(400).json({ error: 'Messages array is required.' });
 
-    const sysWithRule = system.slice(0, 700) +
-      '\n\nCRITICAL: Always complete your full response. Never cut off mid-sentence or mid-thought. If approaching length, wrap up cleanly.';
+    const history = messages
+      .slice(-6) // last 6 only — cost control
+      .filter(m => m && typeof m.role === 'string' && typeof m.content === 'string')
+      .map(m => ({
+        role:    ['user','assistant','system'].includes(m.role) ? m.role : 'user',
+        content: String(m.content).slice(0, 1000),
+      }));
+
+    if (!history.length) return res.status(400).json({ error: 'No valid messages provided.' });
+
+    const sysPrompt = system
+      + '\n\nAlways complete your full response. Never cut off mid-sentence. If approaching length, wrap up cleanly.';
 
     const completion = await openai.chat.completions.create({
       model:      FAST,
       max_tokens: 800,
-      messages: [
-        { role: 'system', content: sysWithRule },
-        ...history,
-      ],
+      messages:   [{ role: 'system', content: sysPrompt }, ...history],
     });
 
+    log('/api/chat', 200, Date.now() - t0);
     res.json({ reply: completion.choices[0].message.content });
+
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    log('/api/chat', 500, Date.now() - t0, e.message);
+    res.status(500).json({ error: 'AI unavailable. Please try again.' });
   }
 });
 
 
 // ══════════════════════════════════════════════════════════════════════════════
 // WARDROBE — POST /api/outfits
-//
-// AI generates outfit combos. Also has a randomizer fallback built in
-// so if someone just wants a quick pick, it works without burning tokens.
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.post('/api/outfits', async (req, res) => {
+app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
   try {
-    const { items = [], occasion = 'casual', weather = 'mild', randomize = false } = req.body;
+    const items     = Array.isArray(req.body.items) ? req.body.items.slice(0, 30) : [];
+    const occasion  = strShort(req.body.occasion, 'casual');
+    const weather   = strShort(req.body.weather,  'mild');
+    const randomize = Boolean(req.body.randomize);
+
     if (!items.length) return res.status(400).json({ error: 'No items provided.' });
 
-    // Pure randomizer — no AI, no cost
+    // Free randomizer — zero AI cost
     if (randomize) {
       const shuffled = [...items].sort(() => Math.random() - 0.5);
-      const picks = shuffled.slice(0, Math.min(3, shuffled.length));
+      const picks    = shuffled.slice(0, Math.min(3, shuffled.length));
       return res.json({
         outfits: [{
-          name: 'RANDOM FIT',
-          pieces: picks.map(p => p.name || p),
-          vibe: 'Randomized pick — style it your way.',
-          confidence: 0.7,
+          name:         'RANDOM FIT',
+          pieces:       picks.map(p => (typeof p === 'object' ? p.name : String(p))),
+          vibe:         'Randomized pick — style it your way.',
+          why_it_works: 'Random selection from your closet.',
+          confidence:   0.7,
         }],
         source: 'randomizer',
       });
     }
 
-    const itemList = items.slice(0, 30)
-      .map((it, i) => `${i + 1}. ${it.name} (${it.color || 'unknown color'}, ${it.type || 'unknown type'}, ${it.style || 'unspecified'})`)
+    const itemList = items
+      .map((it, i) => {
+        const name  = typeof it === 'object' ? (it.name  || 'unknown') : String(it);
+        const color = typeof it === 'object' ? (it.color || 'unknown') : '';
+        const type  = typeof it === 'object' ? (it.type  || 'unknown') : '';
+        const style = typeof it === 'object' ? (it.style || '')        : '';
+        return `${i + 1}. ${name}${color ? ` (${color}` : ''}${type ? `, ${type}` : ''}${style ? `, ${style}` : ''}${color ? ')' : ''}`;
+      })
       .join('\n');
 
     const out = await ask(
-      `You are a fashion AI for a dark luxury streetwear brand (Night.inc — NOCTIS/2AM aesthetic).
-Build outfit combinations from the user's closet. Be specific about why pieces work together — color theory, silhouette, occasion match.
+      `You are a fashion AI for Night.inc — a dark luxury streetwear brand (NOCTIS/2AM aesthetic).
+Build outfit combinations from the user's closet. Be specific about why pieces work — color theory, silhouette, occasion.
 Return ONLY valid JSON.`,
-
-      `Occasion: ${occasion}. Weather: ${weather}.
-Closet:
-${itemList}
-
-JSON:
-{
-  "outfits": [
-    {
-      "name": "<outfit name — creative, fits the dark luxury aesthetic>",
-      "pieces": ["<exact item name from list>", "<exact item name>", "<exact item name>"],
-      "vibe": "<one sentence — the feeling/look this creates>",
-      "why_it_works": "<one sentence — color/silhouette/occasion logic>",
-      "confidence": <0.0-1.0>
-    }
-  ],
-  "source": "ai"
-}
-
-Rules: 3-5 outfits, 2-4 pieces each, only use items from the closet list, confidence = how well they actually match.`,
+      `Occasion: ${occasion}. Weather: ${weather}.\nCloset:\n${itemList}\n\nJSON:\n{"outfits":[{"name":"<creative name>","pieces":["<item>","<item>","<item>"],"vibe":"<one sentence>","why_it_works":"<color/silhouette logic>","confidence":<0.0-1.0>}],"source":"ai"}\n\nRules: 3-5 outfits, 2-4 pieces each, only items from the list, confidence = how well they match.`,
       true, 1200, FAST
     );
 
-    res.json(JSON.parse(out));
+    let parsed;
+    try { parsed = JSON.parse(out); }
+    catch { return res.status(502).json({ error: 'AI returned invalid response. Please try again.' }); }
+
+    log('/api/outfits', 200, Date.now() - t0);
+    res.json(parsed);
+
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    log('/api/outfits', 500, Date.now() - t0, e.message);
+    res.status(500).json({ error: 'Outfit generation failed. Please try again.' });
   }
 });
 
 
-// ══════════════════════════════════════════════════════════════════════════════
-// KINETIC / AURA / DECK
-// All three use POST /api/chat with their own system prompts from the app.
-// No separate routes needed — /api/chat handles any {system, messages} pair.
-// ══════════════════════════════════════════════════════════════════════════════
+// ─── 404 handler ──────────────────────────────────────────────────────────────
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found.' });
+});
 
+// ─── Global error handler ─────────────────────────────────────────────────────
+app.use((err, req, res, next) => {
+  console.error(`[${new Date().toISOString()}] Unhandled error:`, err.message);
+  res.status(500).json({ error: 'Something went wrong. Please try again.' });
+});
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => console.log(`Night.inc backend → port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`[${new Date().toISOString()}] Night.inc backend → port ${PORT}`);
+  console.log(`Auth: ${APP_SECRET ? 'ENABLED' : 'DISABLED (set APP_SECRET to enable)'}`);
+});
