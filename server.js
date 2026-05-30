@@ -458,17 +458,18 @@ app.post('/api/chat', requireAuth, aiLimiter, async (req, res) => {
 app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
   const t0 = Date.now();
   try {
-    const items          = Array.isArray(req.body.items) ? req.body.items.slice(0, 50) : [];
+    const items          = Array.isArray(req.body.items) ? req.body.items.slice(0, 60) : [];
     const occasion       = strShort(req.body.occasion, 'casual');
     const weather        = strShort(req.body.weather,  'mild');
-    const notes          = strShort(req.body.notes,    '');   // user's comment/vibe note
+    const notes          = strShort(req.body.notes,    '');
+    const nonce          = req.body.nonce || Math.random(); // forces unique request
     const previousCombos = Array.isArray(req.body.previousCombos)
-      ? req.body.previousCombos.slice(0, 10)
+      ? req.body.previousCombos.slice(0, 20)
       : [];
 
     if (!items.length) return res.status(400).json({ error: 'No items provided.' });
 
-    // Build item list
+    // Build numbered item list — exact names the AI must copy verbatim
     const itemList = items
       .map((it, i) => {
         const name  = typeof it === 'object' ? (it.name  || 'unknown') : String(it);
@@ -476,51 +477,81 @@ app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
         const type  = typeof it === 'object' ? (it.type  || '')        : '';
         const style = typeof it === 'object' ? (it.style || '')        : '';
         const parts = [color, type, style].filter(Boolean).join(', ');
-        return `${i + 1}. ${name}${parts ? ` (${parts})` : ''}`;
+        return `${i + 1}. "${name}"${parts ? ` — ${parts}` : ''}`;
       })
       .join('\n');
 
-    // Tell the AI what combos to avoid
-    const avoidBlock = previousCombos.length
-      ? `\nAVOID — do not repeat these combos the user already saw:\n${previousCombos.map((c, i) => `${i + 1}. ${Array.isArray(c) ? c.join(' + ') : c}`).join('\n')}`
+    // Build AVOID block — flat readable strings, very explicit
+    // previousCombos arrives as array of string arrays e.g. [["Black Tee","Grey Cargo","AF1s"]]
+    const avoidLines = previousCombos
+      .map((c, i) => {
+        const combo = Array.isArray(c) ? c.join(' + ') : String(c);
+        return `  BANNED #${i + 1}: ${combo}`;
+      })
+      .join('\n');
+
+    const avoidBlock = avoidLines
+      ? `\n⛔ BANNED COMBINATIONS — you have already shown these, DO NOT use any of them again:\n${avoidLines}\n`
       : '';
 
-    // Inject randomness so the AI doesn't default to the same "safe" pick
-    const randomSeed = ['bold', 'minimal', 'layered', 'monochrome', 'contrast', 'streetwear-forward', 'clean', 'oversized'][Math.floor(Math.random() * 8)];
+    // Pick a focus item to anchor the outfit — forces AI to start from a different piece each time
+    // Weight toward less-used items if we have history
+    const usedNames = new Set(previousCombos.flat());
+    const unusedItems = items.filter(it => {
+      const name = typeof it === 'object' ? it.name : String(it);
+      return !usedNames.has(name);
+    });
+    const anchorPool = unusedItems.length > 0 ? unusedItems : items;
+    const anchorItem = anchorPool[Math.floor(Math.random() * anchorPool.length)];
+    const anchorName = typeof anchorItem === 'object' ? anchorItem.name : String(anchorItem);
+
+    // Style directions — pick random, different feel each call
+    const styles = [
+      'tonal and minimal — same color family, clean silhouette',
+      'bold contrast — light and dark pieces clashing intentionally',
+      'layered and textured — multiple pieces with visual depth',
+      'monochrome — one dominant color throughout',
+      'streetwear-forward — oversized, graphic-friendly, relaxed fit',
+      'sharp and clean — fitted, no excess, every piece intentional',
+      'dark and muted — blacks, greys, navies only',
+      'unexpected combo — pair pieces that seem unlikely but work'
+    ];
+    const stylePick = styles[Math.floor(Math.random() * styles.length)];
 
     const out = await ask(
-      `You are a fashion AI — an expert stylist who knows color theory, silhouette, and streetwear culture.
-Your job: pick ONE great outfit from the user's closet for the occasion and weather given.
-Every time you are called you must pick a DIFFERENT combination — explore the closet creatively.
-Think like a stylist, not an algorithm — consider mood, layering, proportion, and color harmony.
-Return ONLY valid JSON.`,
+      `You are an elite fashion stylist who builds outfits from a user's real closet.
+Rules you MUST follow every single time:
+1. Only use items from the numbered closet list — copy names EXACTLY as written
+2. Never repeat a banned combination — if pieces overlap with any BANNED combo, pick different pieces
+3. Anchor your outfit around the suggested starting piece — build the rest around it
+4. Apply the style direction given — it changes every call to force variety
+5. Return ONLY valid JSON, nothing else`,
 
-      `Occasion: ${occasion}
-Weather: ${weather}
-Style direction for this pick: ${randomSeed}
-${notes ? `User note: "${notes}"` : ''}
+      `Occasion: ${occasion} | Weather: ${weather} | Call: ${nonce}
+Style direction THIS time: ${stylePick}
+Anchor piece (build the outfit around this): "${anchorName}"
+${notes ? `User requirement: "${notes}"` : ''}
 ${avoidBlock}
-
-Closet:
+CLOSET (use exact names):
 ${itemList}
 
-Pick ONE outfit. Return this exact JSON:
+Return ONLY this JSON:
 {
   "outfit": {
-    "name": "<creative outfit name — 2-4 words, fits the vibe>",
-    "pieces": ["<exact item name from closet>", "<exact item name>", "<exact item name>"],
-    "vibe": "<one sentence — the mood or look this creates>",
-    "why_it_works": "<one sentence — specific color/silhouette/occasion reasoning>",
-    "stylist_tip": "<one actionable tip — how to wear it, what to do with the fit, shoes, accessories>",
-    "confidence": <0.7-1.0>
+    "name": "<2-4 word creative name>",
+    "pieces": ["<exact name from closet>", "<exact name>", "<exact name>"],
+    "vibe": "<one sentence — the mood this creates>",
+    "why_it_works": "<one sentence — color or silhouette logic>",
+    "stylist_tip": "<one actionable wearing tip>",
+    "confidence": <0.75-1.0>
   }
 }
 
-Rules:
-- Only use items that exist in the closet list above
-- 2-4 pieces maximum
-- Must be a different combo from any in the AVOID list
-- Be creative — do not always default to the most obvious combination`,
+Checklist before responding:
+- All pieces exist in the closet list? ✓
+- Zero overlap with any BANNED combo? ✓  
+- Outfit anchored around "${anchorName}"? ✓
+- Applied style direction "${stylePick}"? ✓`,
       true, 600, FAST
     );
 
@@ -528,7 +559,18 @@ Rules:
     try { parsed = JSON.parse(out); }
     catch { return res.status(502).json({ error: 'AI returned invalid response. Please try again.' }); }
 
-    log('/api/outfits', 200, Date.now() - t0);
+    // Server-side validation: reject if pieces overlap with a banned combo
+    const returnedPieces = (parsed?.outfit?.pieces || []).map(p => p.toLowerCase());
+    for (const banned of previousCombos) {
+      const bannedLower = (Array.isArray(banned) ? banned : [banned]).map(b => b.toLowerCase());
+      const overlap = bannedLower.filter(b => returnedPieces.includes(b));
+      if (overlap.length >= Math.min(bannedLower.length, 2)) {
+        // Too much overlap — add a note but still return (client can re-tap)
+        parsed.outfit._repeated_warning = true;
+      }
+    }
+
+    log('/api/outfits', 200, Date.now() - t0, `pieces=${parsed?.outfit?.pieces?.length ?? 0}`);
     res.json({ ...parsed, source: 'ai' });
 
   } catch (e) {
