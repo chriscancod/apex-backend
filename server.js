@@ -458,127 +458,210 @@ app.post('/api/chat', requireAuth, aiLimiter, async (req, res) => {
 app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
   const t0 = Date.now();
   try {
-    const items          = Array.isArray(req.body.items) ? req.body.items.slice(0, 60) : [];
+    const items          = Array.isArray(req.body.items) ? req.body.items.slice(0, 100) : [];
     const occasion       = strShort(req.body.occasion, 'casual');
     const weather        = strShort(req.body.weather,  'mild');
-    const notes          = strShort(req.body.notes,    '');
-    const nonce          = req.body.nonce || Math.random(); // forces unique request
+    const notes          = strShort(req.body.notes,    '').toLowerCase();
     const previousCombos = Array.isArray(req.body.previousCombos)
-      ? req.body.previousCombos.slice(0, 20)
+      ? req.body.previousCombos.slice(0, 50)
       : [];
 
-    if (!items.length) return res.status(400).json({ error: 'No items provided.' });
+    if (items.length < 2) return res.status(400).json({ error: 'Add at least 2 items to your closet.' });
 
-    // Build numbered item list — exact names the AI must copy verbatim
-    const itemList = items
-      .map((it, i) => {
-        const name  = typeof it === 'object' ? (it.name  || 'unknown') : String(it);
-        const color = typeof it === 'object' ? (it.color || '')        : '';
-        const type  = typeof it === 'object' ? (it.type  || '')        : '';
-        const style = typeof it === 'object' ? (it.style || '')        : '';
-        const parts = [color, type, style].filter(Boolean).join(', ');
-        return `${i + 1}. "${name}"${parts ? ` — ${parts}` : ''}`;
-      })
-      .join('\n');
+    // ── Smart Randomizer ─────────────────────────────────────────────────────
+    // No AI for selection — pure logic. AI only writes the vibe/tip description.
+    // This guarantees a different combo every tap.
 
-    // Build AVOID block — flat readable strings, very explicit
-    // previousCombos arrives as array of string arrays e.g. [["Black Tee","Grey Cargo","AF1s"]]
-    const avoidLines = previousCombos
-      .map((c, i) => {
-        const combo = Array.isArray(c) ? c.join(' + ') : String(c);
-        return `  BANNED #${i + 1}: ${combo}`;
-      })
-      .join('\n');
+    // Categorise items by role
+    const byRole = { top: [], bottom: [], shoes: [], layer: [] };
+    const TOP_TYPES    = ['tee','hoodie','shirt','top','crewneck','longsleeve','tank','jersey'];
+    const BOTTOM_TYPES = ['pants','jeans','shorts','sweats','cargo','trousers','joggers','skirt'];
+    const SHOE_TYPES   = ['footwear','shoes','sneakers','boots','slides','sandals'];
+    const LAYER_TYPES  = ['jacket','coat','zip','vest','blazer','accessory','bag','hat','cap','beanie'];
 
-    const avoidBlock = avoidLines
-      ? `\n⛔ BANNED COMBINATIONS — you have already shown these, DO NOT use any of them again:\n${avoidLines}\n`
-      : '';
+    for (const it of items) {
+      const type = (typeof it === 'object' ? (it.type || '') : '').toLowerCase();
+      const name = (typeof it === 'object' ? (it.name || '') : String(it)).toLowerCase();
+      const combined = type + ' ' + name;
+      if      (LAYER_TYPES .some(k => combined.includes(k))) byRole.layer .push(it);
+      else if (SHOE_TYPES  .some(k => combined.includes(k))) byRole.shoes .push(it);
+      else if (BOTTOM_TYPES.some(k => combined.includes(k))) byRole.bottom.push(it);
+      else if (TOP_TYPES   .some(k => combined.includes(k))) byRole.top   .push(it);
+      else byRole.top.push(it); // fallback — treat unknown as top
+    }
 
-    // Pick a focus item to anchor the outfit — forces AI to start from a different piece each time
-    // Weight toward less-used items if we have history
-    const usedNames = new Set(previousCombos.flat());
-    const unusedItems = items.filter(it => {
-      const name = typeof it === 'object' ? it.name : String(it);
-      return !usedNames.has(name);
-    });
-    const anchorPool = unusedItems.length > 0 ? unusedItems : items;
-    const anchorItem = anchorPool[Math.floor(Math.random() * anchorPool.length)];
-    const anchorName = typeof anchorItem === 'object' ? anchorItem.name : String(anchorItem);
+    // Need at least a top and one other piece
+    if (!byRole.top.length) return res.status(400).json({ error: 'No tops in closet. Add a tee, hoodie, or shirt.' });
 
-    // Style directions — pick random, different feel each call
-    const styles = [
-      'tonal and minimal — same color family, clean silhouette',
-      'bold contrast — light and dark pieces clashing intentionally',
-      'layered and textured — multiple pieces with visual depth',
-      'monochrome — one dominant color throughout',
-      'streetwear-forward — oversized, graphic-friendly, relaxed fit',
-      'sharp and clean — fitted, no excess, every piece intentional',
-      'dark and muted — blacks, greys, navies only',
-      'unexpected combo — pair pieces that seem unlikely but work'
-    ];
-    const stylePick = styles[Math.floor(Math.random() * styles.length)];
-
-    const out = await ask(
-      `You are an elite fashion stylist who builds outfits from a user's real closet.
-Rules you MUST follow every single time:
-1. Only use items from the numbered closet list — copy names EXACTLY as written
-2. Never repeat a banned combination — if pieces overlap with any BANNED combo, pick different pieces
-3. Anchor your outfit around the suggested starting piece — build the rest around it
-4. Apply the style direction given — it changes every call to force variety
-5. Return ONLY valid JSON, nothing else`,
-
-      `Occasion: ${occasion} | Weather: ${weather} | Call: ${nonce}
-Style direction THIS time: ${stylePick}
-Anchor piece (build the outfit around this): "${anchorName}"
-${notes ? `User requirement: "${notes}"` : ''}
-${avoidBlock}
-CLOSET (use exact names):
-${itemList}
-
-Return ONLY this JSON:
-{
-  "outfit": {
-    "name": "<2-4 word creative name>",
-    "pieces": ["<exact name from closet>", "<exact name>", "<exact name>"],
-    "vibe": "<one sentence — the mood this creates>",
-    "why_it_works": "<one sentence — color or silhouette logic>",
-    "stylist_tip": "<one actionable wearing tip>",
-    "confidence": <0.75-1.0>
-  }
-}
-
-Checklist before responding:
-- All pieces exist in the closet list? ✓
-- Zero overlap with any BANNED combo? ✓  
-- Outfit anchored around "${anchorName}"? ✓
-- Applied style direction "${stylePick}"? ✓`,
-      true, 600, FAST
+    // Build set of all previously shown combos for fast lookup
+    const bannedSets = previousCombos.map(c =>
+      new Set((Array.isArray(c) ? c : [c]).map(n => n.toLowerCase().trim()))
     );
 
-    let parsed;
-    try { parsed = JSON.parse(out); }
-    catch { return res.status(502).json({ error: 'AI returned invalid response. Please try again.' }); }
+    function isBanned(pieces) {
+      const nameSet = new Set(pieces.map(p => getName(p).toLowerCase().trim()));
+      return bannedSets.some(banned => {
+        // banned if 2+ pieces overlap with any previous combo
+        let overlap = 0;
+        for (const n of banned) { if (nameSet.has(n)) overlap++; }
+        return overlap >= Math.min(banned.size, 2);
+      });
+    }
 
-    // Server-side validation: reject if pieces overlap with a banned combo
-    const returnedPieces = (parsed?.outfit?.pieces || []).map(p => p.toLowerCase());
-    for (const banned of previousCombos) {
-      const bannedLower = (Array.isArray(banned) ? banned : [banned]).map(b => b.toLowerCase());
-      const overlap = bannedLower.filter(b => returnedPieces.includes(b));
-      if (overlap.length >= Math.min(bannedLower.length, 2)) {
-        // Too much overlap — add a note but still return (client can re-tap)
-        parsed.outfit._repeated_warning = true;
+    function getName(it) {
+      return typeof it === 'object' ? (it.name || 'item') : String(it);
+    }
+    function getColor(it) {
+      return typeof it === 'object' ? (it.color || 'grey') : 'grey';
+    }
+
+    // Fisher-Yates shuffle
+    function shuffle(arr) {
+      const a = [...arr];
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    }
+
+    // Color harmony score — 0-100
+    function harmonyScore(pieces) {
+      if (pieces.length < 2) return 70;
+
+      // Parse hex colors
+      function hexToRgb(color) {
+        // color might be a name like "Black" or a hex like "#111"
+        const nameMap = {
+          black:'#111111', white:'#f5f5f0', grey:'#888888', gray:'#888888',
+          navy:'#1b2a4a', blue:'#2563eb', red:'#dc2626', green:'#16a34a',
+          brown:'#92400e', beige:'#d4c5a9', cream:'#fef3c7', orange:'#ea580c',
+          purple:'#7c3aed', pink:'#f472b6', yellow:'#eab308', olive:'#4d7c0f',
+          tan:'#d97706', camel:'#b45309', rust:'#b45309', burgundy:'#7f1d1d',
+          charcoal:'#374151', slate:'#64748b', khaki:'#bdb76b', stone:'#a8a29e',
+        };
+        let hex = color.toLowerCase().startsWith('#') ? color : (nameMap[color.toLowerCase()] || '#888888');
+        hex = hex.replace('#','');
+        if (hex.length === 3) hex = hex.split('').map(c=>c+c).join('');
+        const n = parseInt(hex, 16);
+        return { r: (n>>16)&255, g: (n>>8)&255, b: n&255 };
+      }
+
+      function luminance({r,g,b}) { return 0.2126*r/255 + 0.7152*g/255 + 0.0722*b/255; }
+      function dist(a,b) { return Math.sqrt((a.r-b.r)**2+(a.g-b.g)**2+(a.b-b.b)**2)/441.7; }
+
+      const rgbs = pieces.map(p => hexToRgb(getColor(p)));
+      let total = 0, pairs = 0;
+      for (let i=0; i<rgbs.length; i++) {
+        for (let j=i+1; j<rgbs.length; j++) {
+          const d = dist(rgbs[i], rgbs[j]);
+          // Great: tonal match (<0.15) or strong contrast (>0.55)
+          const score = d < 0.15 ? 95 : d > 0.55 ? 88 : Math.max(30, 85 - d*100);
+          total += score; pairs++;
+        }
+      }
+      return Math.round(total / pairs);
+    }
+
+    // Apply user notes as filters
+    function passesNoteFilter(pieces) {
+      if (!notes) return true;
+      const pieceText = pieces.map(p => `${getName(p)} ${getColor(p)}`).join(' ').toLowerCase();
+      // "no hoodie" → reject if any piece name includes "hoodie"
+      const noMatch = notes.match(/no\s+(\w+)/g);
+      if (noMatch) {
+        for (const m of noMatch) {
+          const word = m.replace('no ', '');
+          if (pieceText.includes(word)) return false;
+        }
+      }
+      // "all black" → prefer dark pieces (don't hard reject, just filter)
+      if (notes.includes('all black') || notes.includes('dark')) {
+        const lightColors = ['white','cream','beige','yellow','pink','light'];
+        if (lightColors.some(c => pieceText.includes(c))) return false;
+      }
+      return true;
+    }
+
+    // Try up to 40 random combos, score them, pick the best that isn't banned
+    let best = null;
+    let bestScore = -1;
+
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const shuffledTops    = shuffle(byRole.top);
+      const shuffledBottoms = shuffle(byRole.bottom);
+      const shuffledShoes   = shuffle(byRole.shoes);
+      const shuffledLayers  = shuffle(byRole.layer);
+
+      const top    = shuffledTops[0];
+      const bottom = shuffledBottoms.length ? shuffledBottoms[0] : null;
+      const shoes  = shuffledShoes.length   ? shuffledShoes[0]   : null;
+      const layer  = shuffledLayers.length && Math.random() > 0.4 ? shuffledLayers[0] : null;
+
+      const pieces = [top, bottom, shoes, layer].filter(Boolean);
+      if (pieces.length < 2) continue;
+      if (isBanned(pieces)) continue;
+      if (!passesNoteFilter(pieces)) continue;
+
+      const score = harmonyScore(pieces);
+      if (score > bestScore) {
+        bestScore = score;
+        best = pieces;
+        // Early exit if score is excellent
+        if (score >= 88) break;
       }
     }
 
-    log('/api/outfits', 200, Date.now() - t0, `pieces=${parsed?.outfit?.pieces?.length ?? 0}`);
-    res.json({ ...parsed, source: 'ai' });
+    // If everything is banned or filtered, pick any combo ignoring ban (user has exhausted closet)
+    if (!best) {
+      const top    = byRole.top[Math.floor(Math.random() * byRole.top.length)];
+      const bottom = byRole.bottom.length ? byRole.bottom[Math.floor(Math.random() * byRole.bottom.length)] : null;
+      const shoes  = byRole.shoes.length  ? byRole.shoes [Math.floor(Math.random() * byRole.shoes.length)]  : null;
+      best = [top, bottom, shoes].filter(Boolean);
+      bestScore = harmonyScore(best);
+    }
+
+    const pieceNames = best.map(getName);
+    const confidence = Math.min(bestScore / 100, 1.0);
+
+    // ── AI writes the human-readable description only ─────────────────────────
+    // Much cheaper: AI doesn't pick pieces, it just describes what the randomizer chose.
+    const closetSummary = best.map(p => `${getName(p)} (${getColor(p)}, ${typeof p==='object'?p.type||'':''} )`).join(', ');
+    const occasionCtx   = `Occasion: ${occasion}. Weather: ${weather}. ${notes ? `User note: "${notes}".` : ''}`;
+
+    const description = await ask(
+      `You are a fashion stylist writing short outfit descriptions. 
+Given a specific outfit, write: a creative 2-4 word outfit name, one sentence vibe, one sentence why it works, one actionable tip.
+Be specific and confident. No filler. Return ONLY valid JSON.`,
+      `${occasionCtx}
+Outfit pieces: ${closetSummary}
+
+JSON:
+{"name":"<2-4 word creative name>","vibe":"<one sentence mood>","why_it_works":"<color/silhouette logic>","stylist_tip":"<one wearing tip>"}`,
+      true, 300, FAST
+    );
+
+    let desc = { name: 'CLEAN BUILD', vibe: '', why_it_works: '', stylist_tip: '' };
+    try { desc = JSON.parse(description); } catch (_) {}
+
+    log('/api/outfits', 200, Date.now() - t0, `score=${bestScore} pieces=${best.length}`);
+    res.json({
+      outfit: {
+        name:        desc.name        || 'CLEAN BUILD',
+        pieces:      pieceNames,
+        vibe:        desc.vibe        || '',
+        why_it_works:desc.why_it_works|| '',
+        stylist_tip: desc.stylist_tip || '',
+        confidence,
+      },
+      source: 'smart_randomizer',
+    });
 
   } catch (e) {
     log('/api/outfits', 500, Date.now() - t0, e.message);
     res.status(500).json({ error: 'Outfit generation failed. Please try again.' });
   }
 });
-
 
 // ─── 404 handler ──────────────────────────────────────────────────────────────
 app.use((req, res) => {
