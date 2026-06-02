@@ -4,6 +4,8 @@ const cors       = require('cors');
 const OpenAI     = require('openai');
 const rateLimit  = require('express-rate-limit');
 const helmet     = require('helmet');
+const bcrypt     = require('bcryptjs');
+const jwt        = require('jsonwebtoken');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -19,7 +21,9 @@ if (!process.env.OPENAI_API_KEY) {
 }
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 45000, maxRetries: 2 });
 
-const APP_SECRET = process.env.APP_SECRET || null;
+const APP_SECRET  = process.env.APP_SECRET  || null;
+const JWT_SECRET  = process.env.JWT_SECRET  || 'grind_night_inc_2026';
+
 function requireAuth(req, res, next) {
   if (!APP_SECRET) return next();
   const secret = req.headers['x-app-secret'];
@@ -51,8 +55,8 @@ function log(route, status, ms, extra = '') { console.log(`[${new Date().toISOSt
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/', (_, res) => res.json({
-  status: 'NIGHT_INC_ONLINE', version: '3.1.0',
-  apps: ['APX','INDEX','NEXUS','KINETIC','AURA','DECK','WARDROBE'],
+  status: 'NIGHT_INC_ONLINE', version: '3.2.0',
+  apps: ['APX','INDEX','NEXUS','KINETIC','AURA','DECK','WARDROBE','GRIND'],
 }));
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -201,7 +205,6 @@ app.post('/api/chat', requireAuth, aiLimiter, async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // WARDROBE — POST /api/outfits
-// Smart randomizer picks pieces. AI only writes the description.
 // ══════════════════════════════════════════════════════════════════════════════
 app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
   const t0 = Date.now();
@@ -214,13 +217,11 @@ app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
 
     if (items.length < 2) return res.status(400).json({ error: 'Add at least 2 items to your closet.' });
 
-    // ── Categorise items ──────────────────────────────────────────────────────
     const byRole = { top: [], bottom: [], shoes: [], layer: [] };
     const TOP_TYPES    = ['tee','hoodie','shirt','top','crewneck','longsleeve','tank','jersey','sweater','sweatshirt'];
     const BOTTOM_TYPES = ['pants','jeans','shorts','sweats','cargo','trousers','joggers','skirt','chinos','denim'];
     const SHOE_TYPES   = ['footwear','shoes','sneakers','boots','slides','sandals','jordan','nike','adidas','new balance','air force','dunks','yeezy','loafer','runner'];
     const LAYER_TYPES  = ['jacket','coat','zip','vest','blazer','windbreaker','puffer','fleece'];
-    // Accessories (watch, chain, hat, bag) are separate — never counted as core pieces
     const ACCESSORY_TYPES = ['accessory','watch','chain','ring','bracelet','necklace','hat','cap','beanie','bag','backpack','tote'];
 
     function getName(it)  { return typeof it==='object' ? (it.name||'item') : String(it); }
@@ -231,145 +232,226 @@ app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
       const type     = getType(it).toLowerCase();
       const name     = getName(it).toLowerCase();
       const combined = `${type} ${name}`;
-
-      // Skip accessories entirely from core outfit building
       if (ACCESSORY_TYPES.some(k => combined.includes(k))) continue;
-
       if      (SHOE_TYPES  .some(k => combined.includes(k))) byRole.shoes .push(it);
       else if (BOTTOM_TYPES.some(k => combined.includes(k))) byRole.bottom.push(it);
       else if (LAYER_TYPES .some(k => combined.includes(k))) byRole.layer .push(it);
       else if (TOP_TYPES   .some(k => combined.includes(k))) byRole.top   .push(it);
-      else byRole.top.push(it); // unknown → treat as top
+      else byRole.top.push(it);
     }
 
     if (!byRole.top.length)    return res.status(400).json({ error: 'No tops found. Add a tee, hoodie, or shirt.' });
     if (!byRole.bottom.length) return res.status(400).json({ error: 'No bottoms found. Add pants or jeans.' });
     if (!byRole.shoes.length)  return res.status(400).json({ error: 'No shoes found. Add sneakers or boots.' });
 
-    // ── Ban logic — scale overlap threshold to closet size ────────────────────
-    // Small closet (≤8 tops+bottoms+shoes) → ban on ANY 1 shared piece
-    // Large closet (>8) → ban on 2+ shared pieces
-    const coreCount = byRole.top.length + byRole.bottom.length + byRole.shoes.length;
+    const coreCount    = byRole.top.length + byRole.bottom.length + byRole.shoes.length;
     const banThreshold = coreCount <= 8 ? 1 : 2;
-
-    const bannedSets = previousCombos.map(c =>
-      new Set((Array.isArray(c) ? c : [c]).map(n => n.toLowerCase().trim()))
-    );
+    const bannedSets   = previousCombos.map(c => new Set((Array.isArray(c) ? c : [c]).map(n => n.toLowerCase().trim())));
 
     function isBanned(pieces) {
       const nameSet = new Set(pieces.map(p => getName(p).toLowerCase().trim()));
-      return bannedSets.some(banned => {
-        let overlap = 0;
-        for (const n of banned) { if (nameSet.has(n)) overlap++; }
-        return overlap >= banThreshold;
-      });
+      return bannedSets.some(banned => { let o=0; for (const n of banned) { if (nameSet.has(n)) o++; } return o >= banThreshold; });
     }
-
-    // Fisher-Yates shuffle
-    function shuffle(arr) {
-      const a = [...arr];
-      for (let i = a.length-1; i > 0; i--) {
-        const j = Math.floor(Math.random()*(i+1));
-        [a[i],a[j]] = [a[j],a[i]];
-      }
-      return a;
-    }
-
-    // Color harmony score
+    function shuffle(arr) { const a=[...arr]; for (let i=a.length-1;i>0;i--) { const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]; } return a; }
     function hexToRgb(color) {
-      const nameMap = { black:'#111111',white:'#f5f5f0',grey:'#888888',gray:'#888888',navy:'#1b2a4a',blue:'#2563eb',red:'#dc2626',green:'#16a34a',brown:'#92400e',beige:'#d4c5a9',cream:'#fef3c7',orange:'#ea580c',purple:'#7c3aed',pink:'#f472b6',yellow:'#eab308',olive:'#4d7c0f',tan:'#d97706',camel:'#b45309',rust:'#b45309',burgundy:'#7f1d1d',charcoal:'#374151',slate:'#64748b',khaki:'#bdb76b',stone:'#a8a29e','off white':'#f0ede8','light grey':'#cccccc','dark grey':'#444444' };
+      const nameMap = { black:'#111111',white:'#f5f5f0',grey:'#888888',gray:'#888888',navy:'#1b2a4a',blue:'#2563eb',red:'#dc2626',green:'#16a34a',brown:'#92400e',beige:'#d4c5a9',cream:'#fef3c7',orange:'#ea580c',purple:'#7c3aed',pink:'#f472b6',yellow:'#eab308',olive:'#4d7c0f',tan:'#d97706',camel:'#b45309',rust:'#b45309',burgundy:'#7f1d1d',charcoal:'#374151',slate:'#64748b',khaki:'#bdb76b',stone:'#a8a29e' };
       let hex = color.toLowerCase().startsWith('#') ? color : (nameMap[color.toLowerCase()] || '#888888');
-      hex = hex.replace('#','');
-      if (hex.length===3) hex = hex.split('').map(c=>c+c).join('');
-      const n = parseInt(hex,16);
-      return { r:(n>>16)&255, g:(n>>8)&255, b:n&255 };
+      hex = hex.replace('#',''); if (hex.length===3) hex=hex.split('').map(c=>c+c).join('');
+      const n=parseInt(hex,16); return { r:(n>>16)&255, g:(n>>8)&255, b:n&255 };
     }
     function harmonyScore(pieces) {
       if (pieces.length < 2) return 70;
-      const rgbs = pieces.map(p => hexToRgb(getColor(p)));
-      let total=0, pairs=0;
+      const rgbs=pieces.map(p=>hexToRgb(getColor(p))); let total=0,pairs=0;
       for (let i=0;i<rgbs.length;i++) for (let j=i+1;j<rgbs.length;j++) {
-        const d = Math.sqrt((rgbs[i].r-rgbs[j].r)**2+(rgbs[i].g-rgbs[j].g)**2+(rgbs[i].b-rgbs[j].b)**2)/441.7;
-        total += d<0.15 ? 95 : d>0.55 ? 88 : Math.max(30, 85-d*100);
-        pairs++;
+        const d=Math.sqrt((rgbs[i].r-rgbs[j].r)**2+(rgbs[i].g-rgbs[j].g)**2+(rgbs[i].b-rgbs[j].b)**2)/441.7;
+        total+=d<0.15?95:d>0.55?88:Math.max(30,85-d*100); pairs++;
       }
       return Math.round(total/pairs);
     }
-
-    // Notes filter
     function passesNoteFilter(pieces) {
       if (!notes) return true;
-      const text = pieces.map(p=>`${getName(p)} ${getColor(p)}`).join(' ').toLowerCase();
-      const noMatch = notes.match(/no\s+(\w+)/g);
+      const text=pieces.map(p=>`${getName(p)} ${getColor(p)}`).join(' ').toLowerCase();
+      const noMatch=notes.match(/no\s+(\w+)/g);
       if (noMatch) for (const m of noMatch) { if (text.includes(m.replace('no ',''))) return false; }
-      if (notes.includes('all black')||notes.includes('dark')) {
-        if (['white','cream','beige','yellow','pink','light'].some(c=>text.includes(c))) return false;
-      }
+      if (notes.includes('all black')||notes.includes('dark')) { if (['white','cream','beige','yellow','pink','light'].some(c=>text.includes(c))) return false; }
       return true;
     }
 
-    // ── Pick best non-banned combo in up to 60 attempts ───────────────────────
-    let best = null, bestScore = -1;
-
-    for (let attempt=0; attempt<60; attempt++) {
-      const top    = shuffle(byRole.top)[0];
-      const bottom = shuffle(byRole.bottom)[0];
-      const shoes  = shuffle(byRole.shoes)[0];
-      // Layer: only 25% of the time to avoid always including the same jacket
-      const layer  = byRole.layer.length && Math.random() > 0.75 ? shuffle(byRole.layer)[0] : null;
-
-      const pieces = [top, bottom, shoes, layer].filter(Boolean);
-      if (isBanned(pieces)) continue;
-      if (!passesNoteFilter(pieces)) continue;
-
-      const score = harmonyScore(pieces);
-      if (score > bestScore) {
-        bestScore = score;
-        best = pieces;
-        if (score >= 88) break; // good enough — stop early
-      }
+    let best=null, bestScore=-1;
+    for (let attempt=0;attempt<60;attempt++) {
+      const top=shuffle(byRole.top)[0], bottom=shuffle(byRole.bottom)[0], shoes=shuffle(byRole.shoes)[0];
+      const layer=byRole.layer.length&&Math.random()>0.75?shuffle(byRole.layer)[0]:null;
+      const pieces=[top,bottom,shoes,layer].filter(Boolean);
+      if (isBanned(pieces)||!passesNoteFilter(pieces)) continue;
+      const score=harmonyScore(pieces);
+      if (score>bestScore) { bestScore=score; best=pieces; if (score>=88) break; }
     }
+    if (!best) { const top=shuffle(byRole.top)[0],bottom=shuffle(byRole.bottom)[0],shoes=shuffle(byRole.shoes)[0]; best=[top,bottom,shoes]; bestScore=harmonyScore(best); }
 
-    // Exhausted closet fallback — ignore ban, pick anything
-    if (!best) {
-      console.log(`[WARDROBE] All combos banned (${previousCombos.length} seen) — ignoring ban`);
-      const top    = shuffle(byRole.top)[0];
-      const bottom = shuffle(byRole.bottom)[0];
-      const shoes  = shuffle(byRole.shoes)[0];
-      best = [top, bottom, shoes];
-      bestScore = harmonyScore(best);
-    }
-
-    const pieceNames = best.map(getName);
-    const confidence = Math.min(bestScore/100, 1.0);
-
-    // ── AI writes description only (not picks) ────────────────────────────────
+    const pieceNames  = best.map(getName);
+    const confidence  = Math.min(bestScore/100,1.0);
     const closetSummary = best.map(p=>`${getName(p)} (${getColor(p)}, ${getType(p)})`).join(', ');
     const description = await ask(
       `You are a fashion stylist. Given a specific outfit, write a creative name, vibe, why it works, and one wearing tip. Be specific and confident. Return ONLY valid JSON.`,
-      `Occasion: ${occasion}. Weather: ${weather}.${notes ? ` User note: "${notes}".` : ''}\nOutfit: ${closetSummary}\n\nJSON:\n{"name":"<2-4 word name>","vibe":"<one sentence mood>","why_it_works":"<color/silhouette logic>","stylist_tip":"<one actionable tip>"}`,
+      `Occasion: ${occasion}. Weather: ${weather}.${notes?` User note: "${notes}".`:''}\nOutfit: ${closetSummary}\n\nJSON:\n{"name":"<2-4 word name>","vibe":"<one sentence mood>","why_it_works":"<color/silhouette logic>","stylist_tip":"<one actionable tip>"}`,
       true, 250, FAST
     );
+    let desc={name:'CLEAN BUILD',vibe:'',why_it_works:'',stylist_tip:''};
+    try { desc=JSON.parse(description); } catch(_) {}
 
-    let desc = { name:'CLEAN BUILD', vibe:'', why_it_works:'', stylist_tip:'' };
-    try { desc = JSON.parse(description); } catch (_) {}
-
-    log('/api/outfits', 200, Date.now()-t0, `score=${bestScore} pieces=${best.length} banned=${previousCombos.length} threshold=${banThreshold}`);
-    res.json({
-      outfit: {
-        name:         desc.name         || 'CLEAN BUILD',
-        pieces:       pieceNames,
-        vibe:         desc.vibe         || '',
-        why_it_works: desc.why_it_works || '',
-        stylist_tip:  desc.stylist_tip  || '',
-        confidence,
-      },
-      source: 'smart_randomizer',
-    });
-
+    log('/api/outfits', 200, Date.now()-t0, `score=${bestScore} pieces=${best.length}`);
+    res.json({ outfit: { name:desc.name||'CLEAN BUILD', pieces:pieceNames, vibe:desc.vibe||'', why_it_works:desc.why_it_works||'', stylist_tip:desc.stylist_tip||'', confidence }, source:'smart_randomizer' });
   } catch (e) {
     log('/api/outfits', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Outfit generation failed. Please try again.' });
+    res.status(500).json({ error: 'Outfit generation failed.' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GRIND BROWSER — Accounts, Profiles, AI Coach
+// ══════════════════════════════════════════════════════════════════════════════
+
+// In-memory stores — swap for Postgres/Redis for production persistence
+const GRIND_USERS    = {};  // { email: { hash, name, username, createdAt } }
+const GRIND_PROFILES = {};  // { email: { profile, bookmarks, history, updatedAt } }
+
+// ── JWT middleware for GRIND routes ───────────────────────────────────────────
+function grindAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'No token provided.' });
+  try {
+    req.grindUser = jwt.verify(auth.split(' ')[1], JWT_SECRET);
+    next();
+  } catch (e) {
+    res.status(401).json({ error: 'Invalid or expired token.' });
+  }
+}
+
+const grindLimiter = rateLimit({
+  windowMs: 15*60*1000, max: 60,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many requests.' },
+});
+
+// ── POST /grind/account/create ────────────────────────────────────────────────
+// Body: { email, password, name, username }
+app.post('/grind/account/create', grindLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const email    = strShort(req.body.email,    '').toLowerCase();
+    const password = strShort(req.body.password, '');
+    const name     = strShort(req.body.name,     '');
+    const username = strShort(req.body.username, '').toLowerCase().replace(/[^a-z0-9_]/g, '');
+
+    if (!email || !email.includes('@'))
+      return res.status(400).json({ error: 'Valid email required.' });
+    if (!password || password.length < 8)
+      return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+    if (GRIND_USERS[email])
+      return res.status(409).json({ error: 'An account with this email already exists.' });
+
+    const hash  = await bcrypt.hash(password, 10);
+    GRIND_USERS[email] = { hash, name, username, createdAt: Date.now() };
+
+    const token = jwt.sign({ email, name, username }, JWT_SECRET, { expiresIn: '365d' });
+    log('/grind/account/create', 200, Date.now()-t0, `user=${email}`);
+    res.json({ token, user: { email, name, username } });
+  } catch (e) {
+    log('/grind/account/create', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Account creation failed.' });
+  }
+});
+
+// ── POST /grind/account/login ─────────────────────────────────────────────────
+// Body: { email, password }
+app.post('/grind/account/login', grindLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const email    = strShort(req.body.email,    '').toLowerCase();
+    const password = strShort(req.body.password, '');
+
+    const user = GRIND_USERS[email];
+    if (!user) return res.status(404).json({ error: 'No account found with this email.' });
+
+    const ok = await bcrypt.compare(password, user.hash);
+    if (!ok) return res.status(401).json({ error: 'Incorrect password.' });
+
+    const token = jwt.sign({ email, name: user.name, username: user.username }, JWT_SECRET, { expiresIn: '365d' });
+    log('/grind/account/login', 200, Date.now()-t0, `user=${email}`);
+    res.json({ token, user: { email, name: user.name, username: user.username } });
+  } catch (e) {
+    log('/grind/account/login', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Login failed.' });
+  }
+});
+
+// ── POST /grind/profile/sync ──────────────────────────────────────────────────
+// Auth: Bearer <token>
+// Body: { profile, bookmarks, history }
+app.post('/grind/profile/sync', grindAuth, grindLimiter, (req, res) => {
+  const t0 = Date.now();
+  try {
+    const { email } = req.grindUser;
+    const profile   = req.body.profile   || {};
+    const bookmarks = Array.isArray(req.body.bookmarks) ? req.body.bookmarks.slice(0, 200)  : [];
+    const history   = Array.isArray(req.body.history)   ? req.body.history.slice(0, 100)    : [];
+
+    // Strip token from stored profile for security
+    const { token: _tok, ...safeProfile } = profile;
+
+    GRIND_PROFILES[email] = {
+      profile:   safeProfile,
+      bookmarks,
+      history,
+      updatedAt: Date.now(),
+    };
+
+    log('/grind/profile/sync', 200, Date.now()-t0, `user=${email} bks=${bookmarks.length} hist=${history.length}`);
+    res.json({ ok: true, synced: Date.now() });
+  } catch (e) {
+    log('/grind/profile/sync', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Sync failed.' });
+  }
+});
+
+// ── GET /grind/profile/load ───────────────────────────────────────────────────
+// Auth: Bearer <token>
+app.get('/grind/profile/load', grindAuth, grindLimiter, (req, res) => {
+  const t0 = Date.now();
+  try {
+    const { email } = req.grindUser;
+    const data = GRIND_PROFILES[email];
+    if (!data) return res.json({ profile: null, bookmarks: [], history: [] });
+    log('/grind/profile/load', 200, Date.now()-t0, `user=${email}`);
+    res.json(data);
+  } catch (e) {
+    log('/grind/profile/load', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Load failed.' });
+  }
+});
+
+// ── POST /grind/coach ─────────────────────────────────────────────────────────
+// Auth: Bearer <token> (optional — works without login too)
+// Body: { message, context? }
+// The AI coach in the left panel hits this
+app.post('/grind/coach', aiLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const message = strShort(req.body.message, '');
+    const context = strShort(req.body.context, '');
+    if (!message) return res.status(400).json({ error: 'Message is required.' });
+
+    const reply = await ask(
+      `You are a sharp, direct AI productivity coach built into GRIND Browser — a browser for builders, students, and young founders. ${context ? `User context: ${context}` : ''}\n\nRules:\n- Max 2 sentences. Never fluff.\n- Be real, not motivational-poster.\n- Give actionable advice when possible.\n- If they're off task, call it out.\n- Know they're likely a young entrepreneur or student.`,
+      message,
+      false, 120, FAST
+    );
+
+    log('/grind/coach', 200, Date.now()-t0);
+    res.json({ reply });
+  } catch (e) {
+    log('/grind/coach', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Coach unavailable.' });
   }
 });
 
