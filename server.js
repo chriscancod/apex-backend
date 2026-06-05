@@ -19,7 +19,9 @@ if (!process.env.OPENAI_API_KEY) {
   console.error('FATAL: OPENAI_API_KEY not set');
   process.exit(1);
 }
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 45000, maxRetries: 2 });
+
+// timeout: 90s — curriculum build needs headroom
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 90000, maxRetries: 1 });
 
 const APP_SECRET = process.env.APP_SECRET || null;
 const JWT_SECRET = process.env.JWT_SECRET || 'grind_night_inc_2026';
@@ -55,7 +57,7 @@ function log(route, status, ms, extra = '') { console.log(`[${new Date().toISOSt
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/', (_, res) => res.json({
-  status: 'NIGHT_INC_ONLINE', version: '3.2.0',
+  status: 'NIGHT_INC_ONLINE', version: '3.3.0',
   apps: ['APX','INDEX','NEXUS','KINETIC','AURA','DECK','WARDROBE','GRIND'],
 }));
 
@@ -98,36 +100,22 @@ app.post('/schedule', requireAuth, aiLimiter, async (req, res) => {
 
     const out = await ask(
       `You are APEX AI — an elite daily scheduler for high-performance people of any age, background, or lifestyle.
-
-Your job: read the user's profile, fixed schedule, and tasks — then build the best possible day around their real life.
-
-HOW TO READ THE CONTEXT:
-• If a fixed schedule is provided — treat those times as NON-NEGOTIABLE. Build everything else around them.
-• If sports or training is listed — include a workout block with specifics matching their sport/fitness level.
-• If a business or project is listed — include focused work blocks for it.
-• If a sleep time is set — that is the hard stop. Nothing after it.
-• Respect the user's actual life. A student has school. An athlete has practice. A founder has brand work.
-
 RULES:
 1. Fixed commitments are sacred — never schedule over them
 2. Fill EVERY hour from wake to sleep — zero gaps, zero truncation
 3. Activities must be SPECIFIC — exact exercises/sets/reps, exact tasks, exact actions. Never vague.
 4. Minimum 8 blocks, as many as needed to cover the full day
 5. Return ONLY valid JSON — complete every block, never stop early
-
 CATEGORIES: ops, fitness, study, biz, church, rest`,
       `OPERATOR: ${username}
 DATE: ${date} ${currentDay} | NOW: ${currentTime}
 WAKE: ${wakeTime} → SLEEP: ${sleepTime}
 ${personalLines ? `ABOUT: ${personalLines}` : ''}
-
 ${fixedBlock}
 NOTES: ${notes || 'none'}
+TASKS:\n${taskList}
 
-TASKS TO FIT IN TODAY:
-${taskList}
-
-JSON (cover every hour ${wakeTime}→${sleepTime}, min 8 blocks):
+JSON:
 {"success":true,"data":{"summary":"<one punchy sentence>","totalXP":<sum>,"blocks":[{"time":"<h:mm AM/PM>","duration":"<X min>","activity":"<SPECIFIC>","category":"<ops|fitness|study|biz|church|rest>","xp":<50-300>}]}}`,
       true, 2500, SMART
     );
@@ -166,79 +154,38 @@ app.post('/apx/finance/advice', requireAuth, aiLimiter, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// INDEX — Curriculum
+// INDEX — Curriculum (3 routes)
 // ══════════════════════════════════════════════════════════════════════════════
+
+// ── /ai/curriculum/build — returns 5 compact lessons fast (<15s) ──────────────
 app.post('/ai/curriculum/build', requireAuth, aiLimiter, async (req, res) => {
   const t0 = Date.now();
   try {
-    const topic   = strShort(req.body.topic,  'Programming');
-    const depth   = strShort(req.body.depth,  'beginner');
-    const style   = strShort(req.body.style,  'practical');
-    const count   = Math.min(Math.max(parseInt(req.body.lesson_count) || 10, 1), 10);
+    const topic = strShort(req.body.topic, 'Programming');
+    const depth = strShort(req.body.depth, 'beginner');
+    const style = strShort(req.body.style, 'practical');
+    // Always 5 lessons — fast, never times out. expand endpoint adds full content.
+    const count = 5;
 
     if (!topic) return res.status(400).json({ error: 'Topic is required.' });
 
     const safeDepth = ['beginner','intermediate','advanced'].includes(depth) ? depth : 'beginner';
     const safeStyle = ['practical','theoretical','project'].includes(style) ? style : 'practical';
 
-    const depthGuide = {
-      beginner:     'Zero prior knowledge assumed. Plain language, everyday analogies.',
-      intermediate: 'Basics assumed. Focus on mechanics, patterns, and edge cases.',
-      advanced:     'Strong foundation assumed. Production thinking, internals, performance.',
-    }[safeDepth];
+    const depthNote = { beginner: 'No prior knowledge assumed.', intermediate: 'Basics assumed, go deeper.', advanced: 'Expert level, production thinking.' }[safeDepth];
+    const styleNote = { practical: 'Lead with working code.', theoretical: 'Build intuition first.', project: 'Each unit builds toward a project.' }[safeStyle];
 
-    const styleGuide = {
-      practical:   'Emphasize working code and hands-on examples.',
-      theoretical: 'Build intuition first, then formalize concepts.',
-      project:     'Each unit is one concrete step toward a finished project.',
-    }[safeStyle];
+    const system = `You are INDEX — an elite curriculum builder. ${depthNote} ${styleNote}
+Return ONLY valid JSON. No markdown. Never truncate. Complete all ${count} lessons fully.`;
 
-    const out = await ask(
-      `You are INDEX — an elite curriculum builder. ${depthGuide} ${styleGuide}
-Write for a sharp learner who moves fast. Each unit must have ONE clear aha moment.
-Return ONLY valid JSON — completely parseable, no markdown fences, never truncate.
+    const user = `Build a ${count}-unit course on "${topic}". Depth: ${safeDepth}. Style: ${safeStyle}.
 
-Build a ${count}-unit course on: "${topic}"
+Return this exact JSON (${count} lessons, 3 quiz questions each, no extra fields):
+{"curriculum":{"id":"c1","topic":"${topic}","tagline":"<what learner will DO>","total_xp":<number>,"earned_xp":0,"lessons":[{"id":"l1","title":"<title>","emoji":"<emoji>","summary":"<1 sentence>","content":"<2 sentence overview>","key_points":["<insight>","<insight>","<insight>"],"xp":<100-200>,"completed":false,"quiz_passed":false,"quiz":[{"id":"q1","question":"<real understanding question>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},{"id":"q2","question":"<scenario: You are building X...>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},{"id":"q3","question":"<debug or apply question>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null}]}]}}
 
-JSON shape — COMPACT mode (no long content, just structure):
-{
-  "curriculum": {
-    "id": "curriculum-1",
-    "topic": "${topic}",
-    "tagline": "<what student will DO — specific, exciting>",
-    "total_xp": <sum of xp>,
-    "earned_xp": 0,
-    "lessons": [
-      {
-        "id": "lesson-1",
-        "title": "<compelling title>",
-        "emoji": "<single emoji>",
-        "summary": "<one sentence — hint at the aha moment>",
-        "content": "<2-3 sentence overview ONLY — the app will request full content separately>",
-        "key_points": ["<real insight>", "<real insight>", "<real insight>"],
-        "xp": <100-200>,
-        "completed": false,
-        "quiz_passed": false,
-        "quiz": [
-          {"id":"q-1-1","question":"<tests real understanding, not trivia>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},
-          {"id":"q-1-2","question":"<scenario-based: You are building X and need to Y>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},
-          {"id":"q-1-3","question":"<practical application or debug question>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null}
-        ]
-      }
-    ]
-  }
-}
+Rules: exactly ${count} lessons, 3 quizzes each, total_xp = sum of xp, content = 2 sentences max.`;
 
-RULES:
-- Exactly ${count} lessons, exactly 3 quiz questions each
-- content field: 2-3 sentences MAXIMUM — just enough to preview the topic
-- key_points: 3 specific, actionable insights (not generic)
-- Quiz questions test understanding, not memorization
-- total_xp = sum of all xp values
-- Return ONLY the JSON object`,
-      `Topic: "${topic}" | Depth: ${safeDepth} | Style: ${safeStyle}`,
-      true, 3500, SMART
-    );
+    const out = await ask(system, user, true, 2500, SMART);
 
     let parsed;
     try { parsed = JSON.parse(out); } catch {
@@ -249,11 +196,11 @@ RULES:
     res.json(parsed);
   } catch (e) {
     log('/ai/curriculum/build', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Curriculum build failed.' });
+    res.status(500).json({ error: `Curriculum build failed: ${e.message}` });
   }
 });
 
-// ── Expand a single unit's learn cards (called lazily when user opens a unit)
+// ── /ai/curriculum/expand — rich learn cards for one unit, called lazily ──────
 app.post('/ai/curriculum/expand', requireAuth, aiLimiter, async (req, res) => {
   const t0 = Date.now();
   try {
@@ -265,51 +212,28 @@ app.post('/ai/curriculum/expand', requireAuth, aiLimiter, async (req, res) => {
 
     if (!unitTitle) return res.status(400).json({ error: 'unit_title is required.' });
 
-    const out = await ask(
-      `You are INDEX — an elite educator. Generate rich interactive learn cards for one unit of a course.
-Each card is shown to the learner BEFORE they take the quiz. Cards must build understanding progressively.
-Return ONLY valid JSON — no markdown fences, completely parseable.
+    const system = `You are INDEX — an elite educator creating interactive learn cards.
+Cards are shown before the quiz to build understanding progressively.
+Return ONLY valid JSON. No markdown fences. Never truncate.`;
 
-Card types:
-- concept: title + clear explanation (plain prose, 3-5 sentences)
-- keyFact: title + bullet list (format body as "• point1\n• point2\n• point3")
-- code: title + explanation + actual runnable code block
-- analogy: title + real-world comparison that makes the concept click
-- visual: title + explanation + visual_emojis array showing a flow or process
-
-Generate 4-6 learn cards for:
-Topic: "${topic}"
-Unit: "${unitTitle}"
-Summary: "${unitSummary}"
+    const user = `Generate 4-5 learn cards for:
+Topic: "${topic}" | Unit: "${unitTitle}" | Summary: "${unitSummary}"
 Depth: ${depth} | Style: ${style}
 
-JSON:
-{
-  "learn_cards": [
-    {
-      "id": "card-1",
-      "type": "concept|keyFact|code|analogy|visual",
-      "title": "<card title>",
-      "body": "<explanation text>",
-      "code": "<actual code if type=code, else omit>",
-      "code_language": "<language if type=code, else omit>",
-      "visual_emojis": ["<emoji>","<emoji>","<emoji>"]
-    }
-  ]
-}
+Card types: concept (prose explanation), keyFact (bullet list), code (real runnable code), analogy (real-world comparison), visual (emoji flow diagram)
 
-RULES:
-- 4-6 cards minimum
-- If style=practical or topic involves code: include at least 1 code card with REAL runnable code
-- code cards: body explains what the code does, code field has actual code (15-40 lines)
-- analogy card: real-world comparison must be genuinely memorable and accurate
-- keyFact card: body must be "• point\n• point\n• point" format, 3-5 points
-- visual card: visual_emojis shows a process flow (3-5 emojis with logical sequence)
-- Build progressive understanding: start simple, get deeper
-- Each card must earn its place — no filler`,
-      `Expand unit "${unitTitle}" for topic "${topic}"`,
-      true, 2000, SMART
-    );
+JSON:
+{"learn_cards":[{"id":"card-1","type":"<type>","title":"<title>","body":"<explanation — for keyFact use bullet format: • point\\n• point>","code":"<only for code type>","code_language":"<only for code type>","visual_emojis":["<emoji>","→","<emoji>","→","<emoji>"]}]}
+
+Rules:
+- 4-5 cards total
+- Include code card with real working code if topic involves programming
+- keyFact body: "• insight\\n• insight\\n• insight" format
+- visual_emojis: 3-5 items showing a process flow with → between steps
+- Build from simple to complex
+- No filler cards`;
+
+    const out = await ask(system, user, true, 2000, SMART);
 
     let parsed;
     try { parsed = JSON.parse(out); } catch {
@@ -320,11 +244,11 @@ RULES:
     res.json(parsed);
   } catch (e) {
     log('/ai/curriculum/expand', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Unit expansion failed.' });
+    res.status(500).json({ error: `Unit expansion failed: ${e.message}` });
   }
 });
 
-// ── Lesson chat
+// ── /ai/curriculum/chat — lesson tutor ───────────────────────────────────────
 app.post('/ai/curriculum/chat', requireAuth, aiLimiter, async (req, res) => {
   const t0 = Date.now();
   try {
@@ -334,15 +258,9 @@ app.post('/ai/curriculum/chat', requireAuth, aiLimiter, async (req, res) => {
     if (!message) return res.status(400).json({ error: 'Message is required.' });
 
     const reply = await ask(
-      `You are INDEX AI — a sharp, direct tutor for "${topic}".
-Lesson context: ${lesson_context}
-
-Rules:
-- Be specific and concrete. Never vague.
-- Pattern: Explain → Example → Apply (how they'd use it in a real project).
-- If asked for resources: name SPECIFIC ones (exact book titles, exact URLs, exact course names).
-- Max 150 words. Never cut off mid-sentence.
-- No filler phrases like "great question!".`,
+      `You are INDEX AI — a sharp, direct tutor for "${topic}". Lesson: ${lesson_context}
+Rules: Be specific. Pattern: Explain → Example → Apply. Name specific resources when asked.
+Max 150 words. Never cut off. No filler phrases.`,
       message, false, 600, FAST
     );
 
@@ -381,7 +299,6 @@ app.post('/api/chat', requireAuth, aiLimiter, async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // WARDROBE — POST /api/outfits
-// Smart randomizer — picks pieces by role + color harmony, AI writes description only
 // ══════════════════════════════════════════════════════════════════════════════
 app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
   const t0 = Date.now();
@@ -405,92 +322,65 @@ app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
     function getType(it)  { return typeof it === 'object' ? (it.type  || '')     : ''; }
 
     for (const it of items) {
-      const type     = getType(it).toLowerCase();
-      const name     = getName(it).toLowerCase();
-      const combined = `${type} ${name}`;
+      const type = getType(it).toLowerCase(); const name = getName(it).toLowerCase(); const combined = `${type} ${name}`;
       if      (SHOE_TYPES  .some(k => combined.includes(k))) byRole.shoes .push(it);
       else if (BOTTOM_TYPES.some(k => combined.includes(k))) byRole.bottom.push(it);
       else if (LAYER_TYPES .some(k => combined.includes(k))) byRole.layer .push(it);
       else                                                    byRole.top   .push(it);
     }
 
-    if (!byRole.top.length)    return res.status(400).json({ error: 'No tops found. Add a tee, hoodie, or shirt.' });
-    if (!byRole.bottom.length) return res.status(400).json({ error: 'No bottoms found. Add pants or jeans.' });
-    if (!byRole.shoes.length)  return res.status(400).json({ error: 'No shoes found. Add sneakers or boots.' });
+    if (!byRole.top.length)    return res.status(400).json({ error: 'No tops found.' });
+    if (!byRole.bottom.length) return res.status(400).json({ error: 'No bottoms found.' });
+    if (!byRole.shoes.length)  return res.status(400).json({ error: 'No shoes found.' });
 
-    const coreCount    = byRole.top.length + byRole.bottom.length + byRole.shoes.length;
+    const coreCount = byRole.top.length + byRole.bottom.length + byRole.shoes.length;
     const banThreshold = coreCount <= 6 ? 1 : 2;
-    const bannedSets   = previousCombos.map(c => new Set((Array.isArray(c) ? c : [c]).map(n => n.toLowerCase().trim())));
+    const bannedSets = previousCombos.map(c => new Set((Array.isArray(c) ? c : [c]).map(n => n.toLowerCase().trim())));
 
-    function isBanned(pieces) {
-      const nameSet = new Set(pieces.map(p => getName(p).toLowerCase().trim()));
-      return bannedSets.some(banned => { let o = 0; for (const n of banned) { if (nameSet.has(n)) o++; } return o >= banThreshold; });
-    }
-    function shuffle(arr) {
-      const a = [...arr];
-      for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
-      return a;
-    }
+    function isBanned(pieces) { const ns = new Set(pieces.map(p => getName(p).toLowerCase().trim())); return bannedSets.some(b => { let o=0; for (const n of b) { if (ns.has(n)) o++; } return o >= banThreshold; }); }
+    function shuffle(arr) { const a=[...arr]; for (let i=a.length-1;i>0;i--) { const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
     function hexToRgb(color) {
-      const nameMap = { black:'#111111',white:'#f5f5f0',grey:'#888888',gray:'#888888',navy:'#1b2a4a',blue:'#2563eb',red:'#dc2626',green:'#16a34a',brown:'#92400e',beige:'#d4c5a9',cream:'#fef3c7',orange:'#ea580c',purple:'#7c3aed',pink:'#f472b6',yellow:'#eab308',olive:'#4d7c0f',tan:'#d97706',camel:'#b45309',rust:'#b45309',burgundy:'#7f1d1d',charcoal:'#374151',slate:'#64748b',khaki:'#bdb76b',stone:'#a8a29e' };
-      let hex = color.toLowerCase().startsWith('#') ? color : (nameMap[color.toLowerCase()] || '#888888');
-      hex = hex.replace('#', ''); if (hex.length === 3) hex = hex.split('').map(c => c+c).join('');
-      const n = parseInt(hex, 16); return { r: (n>>16)&255, g: (n>>8)&255, b: n&255 };
+      const nm = { black:'#111111',white:'#f5f5f0',grey:'#888888',gray:'#888888',navy:'#1b2a4a',blue:'#2563eb',red:'#dc2626',green:'#16a34a',brown:'#92400e',beige:'#d4c5a9',cream:'#fef3c7',orange:'#ea580c',purple:'#7c3aed',pink:'#f472b6',yellow:'#eab308',olive:'#4d7c0f',tan:'#d97706',camel:'#b45309',rust:'#b45309',burgundy:'#7f1d1d',charcoal:'#374151',slate:'#64748b',khaki:'#bdb76b',stone:'#a8a29e' };
+      let hex = color.toLowerCase().startsWith('#') ? color : (nm[color.toLowerCase()] || '#888888');
+      hex = hex.replace('#',''); if (hex.length===3) hex=hex.split('').map(c=>c+c).join('');
+      const n=parseInt(hex,16); return {r:(n>>16)&255,g:(n>>8)&255,b:n&255};
     }
     function harmonyScore(pieces) {
-      if (pieces.length < 2) return 70;
-      const rgbs = pieces.map(p => hexToRgb(getColor(p))); let total = 0, pairs = 0;
-      for (let i = 0; i < rgbs.length; i++) for (let j = i+1; j < rgbs.length; j++) {
-        const d = Math.sqrt((rgbs[i].r-rgbs[j].r)**2+(rgbs[i].g-rgbs[j].g)**2+(rgbs[i].b-rgbs[j].b)**2)/441.7;
-        total += d < 0.15 ? 95 : d > 0.55 ? 88 : Math.max(30, 85 - d*100); pairs++;
-      }
-      return Math.round(total / pairs);
+      if (pieces.length<2) return 70;
+      const rgbs=pieces.map(p=>hexToRgb(getColor(p))); let total=0,pairs=0;
+      for (let i=0;i<rgbs.length;i++) for (let j=i+1;j<rgbs.length;j++) { const d=Math.sqrt((rgbs[i].r-rgbs[j].r)**2+(rgbs[i].g-rgbs[j].g)**2+(rgbs[i].b-rgbs[j].b)**2)/441.7; total+=d<0.15?95:d>0.55?88:Math.max(30,85-d*100); pairs++; }
+      return Math.round(total/pairs);
     }
     function passesNoteFilter(pieces) {
       if (!notes) return true;
-      const text = pieces.map(p => `${getName(p)} ${getColor(p)}`).join(' ').toLowerCase();
-      const noMatch = notes.match(/no\s+(\w+)/g);
-      if (noMatch) for (const m of noMatch) { if (text.includes(m.replace('no ', ''))) return false; }
-      if (notes.includes('all black') || notes.includes('dark')) {
-        if (['white','cream','beige','yellow','pink','light'].some(c => text.includes(c))) return false;
-      }
+      const text=pieces.map(p=>`${getName(p)} ${getColor(p)}`).join(' ').toLowerCase();
+      const noMatch=notes.match(/no\s+(\w+)/g); if (noMatch) for (const m of noMatch) { if (text.includes(m.replace('no ',''))) return false; }
+      if ((notes.includes('all black')||notes.includes('dark')) && ['white','cream','beige','yellow','pink','light'].some(c=>text.includes(c))) return false;
       return true;
     }
 
-    let best = null, bestScore = -1;
-    for (let attempt = 0; attempt < 60; attempt++) {
-      const top    = shuffle(byRole.top)[0];
-      const bottom = shuffle(byRole.bottom)[0];
-      const shoes  = shuffle(byRole.shoes)[0];
-      const layer  = byRole.layer.length && Math.random() > 0.75 ? shuffle(byRole.layer)[0] : null;
-      const pieces = [top, bottom, shoes, layer].filter(Boolean);
-      if (isBanned(pieces) || !passesNoteFilter(pieces)) continue;
-      const score = harmonyScore(pieces);
-      if (score > bestScore) { bestScore = score; best = pieces; if (score >= 88) break; }
+    let best=null, bestScore=-1;
+    for (let attempt=0;attempt<60;attempt++) {
+      const top=shuffle(byRole.top)[0], bottom=shuffle(byRole.bottom)[0], shoes=shuffle(byRole.shoes)[0];
+      const layer=byRole.layer.length&&Math.random()>0.75?shuffle(byRole.layer)[0]:null;
+      const pieces=[top,bottom,shoes,layer].filter(Boolean);
+      if (isBanned(pieces)||!passesNoteFilter(pieces)) continue;
+      const score=harmonyScore(pieces); if (score>bestScore) { bestScore=score; best=pieces; if (score>=88) break; }
     }
-    if (!best) {
-      const top = shuffle(byRole.top)[0], bottom = shuffle(byRole.bottom)[0], shoes = shuffle(byRole.shoes)[0];
-      best = [top, bottom, shoes]; bestScore = harmonyScore(best);
-    }
+    if (!best) { best=[shuffle(byRole.top)[0],shuffle(byRole.bottom)[0],shuffle(byRole.shoes)[0]]; bestScore=harmonyScore(best); }
 
-    const pieceNames    = best.map(getName);
-    const confidence    = Math.min(bestScore / 100, 1.0);
-    const closetSummary = best.map(p => `${getName(p)} (${getColor(p)}, ${getType(p)})`).join(', ');
-
+    const pieceNames=best.map(getName), confidence=Math.min(bestScore/100,1.0);
+    const closetSummary=best.map(p=>`${getName(p)} (${getColor(p)}, ${getType(p)})`).join(', ');
     const description = await ask(
-      `You are a fashion stylist. Given a specific outfit, write a creative name, vibe, why it works, and one wearing tip. Be specific and confident. Return ONLY valid JSON.`,
-      `Occasion: ${occasion}. Weather: ${weather}.${notes ? ` User note: "${notes}".` : ''}
-Outfit: ${closetSummary}
-
-JSON:
-{"name":"<2-4 word creative name>","vibe":"<one sentence mood>","why_it_works":"<color/silhouette logic>","stylist_tip":"<one actionable tip>"}`,
+      'You are a fashion stylist. Return ONLY valid JSON.',
+      `Occasion: ${occasion}. Weather: ${weather}.${notes?` Note: "${notes}".`:''}\nOutfit: ${closetSummary}\nJSON:{"name":"<2-4 word name>","vibe":"<one sentence>","why_it_works":"<color/silhouette logic>","stylist_tip":"<one tip>"}`,
       true, 250, FAST
     );
-    let desc = { name: 'CLEAN BUILD', vibe: '', why_it_works: '', stylist_tip: '' };
-    try { desc = JSON.parse(description); } catch (_) {}
+    let desc={name:'CLEAN BUILD',vibe:'',why_it_works:'',stylist_tip:''};
+    try { desc=JSON.parse(description); } catch (_) {}
 
-    log('/api/outfits', 200, Date.now()-t0, `score=${bestScore} pieces=${best.length}`);
-    res.json({ outfit: { name: desc.name || 'CLEAN BUILD', pieces: pieceNames, vibe: desc.vibe || '', why_it_works: desc.why_it_works || '', stylist_tip: desc.stylist_tip || '', confidence }, source: 'smart_randomizer' });
+    log('/api/outfits', 200, Date.now()-t0, `score=${bestScore}`);
+    res.json({ outfit: { name:desc.name||'CLEAN BUILD', pieces:pieceNames, vibe:desc.vibe||'', why_it_works:desc.why_it_works||'', stylist_tip:desc.stylist_tip||'', confidence }, source:'smart_randomizer' });
   } catch (e) {
     log('/api/outfits', 500, Date.now()-t0, e.message);
     res.status(500).json({ error: 'Outfit generation failed.' });
@@ -521,7 +411,7 @@ app.post('/grind/account/create', grindLimiter, async (req, res) => {
     if (!email || !email.includes('@')) return res.status(400).json({ error: 'Valid email required.' });
     if (!password || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
     if (GRIND_USERS[email]) return res.status(409).json({ error: 'An account with this email already exists.' });
-    const hash  = await bcrypt.hash(password, 10);
+    const hash = await bcrypt.hash(password, 10);
     GRIND_USERS[email] = { hash, name, username, createdAt: Date.now() };
     const token = jwt.sign({ email, name, username }, JWT_SECRET, { expiresIn: '365d' });
     log('/grind/account/create', 200, Date.now()-t0, `user=${email}`);
@@ -588,8 +478,8 @@ app.post('/grind/coach', aiLimiter, async (req, res) => {
     const context = strShort(req.body.context, '');
     if (!message) return res.status(400).json({ error: 'Message is required.' });
     const reply = await ask(
-      `You are a sharp, direct AI productivity coach built into GRIND Browser — a browser for builders, students, and young founders. ${context ? `User context: ${context}` : ''}
-Rules: Max 2 sentences. No fluff. Be real, not motivational-poster. Give actionable advice. If they're off task, call it out.`,
+      `You are a sharp, direct AI productivity coach built into GRIND Browser.${context ? ` User: ${context}` : ''}
+Max 2 sentences. No fluff. Actionable only.`,
       message, false, 120, FAST
     );
     log('/grind/coach', 200, Date.now()-t0);
