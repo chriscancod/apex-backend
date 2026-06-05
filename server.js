@@ -171,30 +171,80 @@ app.post('/apx/finance/advice', requireAuth, aiLimiter, async (req, res) => {
 app.post('/ai/curriculum/build', requireAuth, aiLimiter, async (req, res) => {
   const t0 = Date.now();
   try {
-    const topic = strShort(req.body.topic, 'Programming');
-    const depth = strShort(req.body.depth, 'beginner');
-    const style = strShort(req.body.style, 'practical');
-    const count = Math.min(Math.max(parseInt(req.body.lesson_count) || 5, 1), 10);
+    const topic   = strShort(req.body.topic,  'Programming');
+    const depth   = strShort(req.body.depth,  'beginner');
+    const style   = strShort(req.body.style,  'practical');
+    const count   = Math.min(Math.max(parseInt(req.body.lesson_count) || 10, 1), 10);
+
     if (!topic) return res.status(400).json({ error: 'Topic is required.' });
+
     const safeDepth = ['beginner','intermediate','advanced'].includes(depth) ? depth : 'beginner';
     const safeStyle = ['practical','theoretical','project'].includes(style) ? style : 'practical';
-    const styleGuide = safeStyle==='practical' ? 'Lead with real working code/examples. Explain every step.' : safeStyle==='theoretical' ? 'Build intuition first with sharp analogies. Then formalize.' : 'Every lesson = one concrete step toward a finished project.';
-    const depthGuide = safeDepth==='beginner' ? 'Zero prior knowledge assumed. Plain language.' : safeDepth==='intermediate' ? 'Basics assumed. Go deep on mechanics and edge cases.' : 'Strong foundation assumed. Advanced patterns and production thinking.';
+
+    const depthGuide = {
+      beginner:     'Zero prior knowledge assumed. Plain language, everyday analogies.',
+      intermediate: 'Basics assumed. Focus on mechanics, patterns, and edge cases.',
+      advanced:     'Strong foundation assumed. Production thinking, internals, performance.',
+    }[safeDepth];
+
+    const styleGuide = {
+      practical:   'Emphasize working code and hands-on examples.',
+      theoretical: 'Build intuition first, then formalize concepts.',
+      project:     'Each unit is one concrete step toward a finished project.',
+    }[safeStyle];
+
     const out = await ask(
-      `You are INDEX — an elite curriculum builder. ${styleGuide} ${depthGuide}
-Write like a brilliant mentor to a sharp 16-year-old who learns fast.
-Each lesson needs one clear aha moment. Use real examples, real code, real analogies.
-Return ONLY valid JSON — no markdown fences, completely parseable. Complete all lessons fully.`,
-      `Build a ${count}-lesson curriculum on: "${topic}"
+      `You are INDEX — an elite curriculum builder. ${depthGuide} ${styleGuide}
+Write for a sharp learner who moves fast. Each unit must have ONE clear aha moment.
+Return ONLY valid JSON — completely parseable, no markdown fences, never truncate.
 
-JSON:
-{"curriculum":{"id":"curriculum-1","topic":"${topic}","tagline":"<what student will DO — specific>","total_xp":<sum>,"earned_xp":0,"lessons":[{"id":"lesson-1","title":"<compelling title>","emoji":"<emoji>","summary":"<one sentence hinting at aha moment>","content":"<rich markdown 200-350 words: headers, bullets, code blocks>","key_points":["<real insight>","<real insight>","<real insight>"],"xp":<100-200>,"completed":false,"quiz_passed":false,"quiz":[{"id":"q-1-1","question":"<tests real understanding>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},{"id":"q-1-2","question":"<different concept>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},{"id":"q-1-3","question":"<practical application>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null}]}]}}
+Build a ${count}-unit course on: "${topic}"
 
-RULES: exactly ${count} lessons, exactly 3 quiz questions each, total_xp = sum of xp. Do NOT truncate.`,
-      true, 6000, SMART
+JSON shape — COMPACT mode (no long content, just structure):
+{
+  "curriculum": {
+    "id": "curriculum-1",
+    "topic": "${topic}",
+    "tagline": "<what student will DO — specific, exciting>",
+    "total_xp": <sum of xp>,
+    "earned_xp": 0,
+    "lessons": [
+      {
+        "id": "lesson-1",
+        "title": "<compelling title>",
+        "emoji": "<single emoji>",
+        "summary": "<one sentence — hint at the aha moment>",
+        "content": "<2-3 sentence overview ONLY — the app will request full content separately>",
+        "key_points": ["<real insight>", "<real insight>", "<real insight>"],
+        "xp": <100-200>,
+        "completed": false,
+        "quiz_passed": false,
+        "quiz": [
+          {"id":"q-1-1","question":"<tests real understanding, not trivia>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},
+          {"id":"q-1-2","question":"<scenario-based: You are building X and need to Y>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},
+          {"id":"q-1-3","question":"<practical application or debug question>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null}
+        ]
+      }
+    ]
+  }
+}
+
+RULES:
+- Exactly ${count} lessons, exactly 3 quiz questions each
+- content field: 2-3 sentences MAXIMUM — just enough to preview the topic
+- key_points: 3 specific, actionable insights (not generic)
+- Quiz questions test understanding, not memorization
+- total_xp = sum of all xp values
+- Return ONLY the JSON object`,
+      `Topic: "${topic}" | Depth: ${safeDepth} | Style: ${safeStyle}`,
+      true, 3500, SMART
     );
+
     let parsed;
-    try { parsed = JSON.parse(out); } catch { return res.status(502).json({ error: 'AI returned invalid curriculum.' }); }
+    try { parsed = JSON.parse(out); } catch {
+      return res.status(502).json({ error: 'AI returned invalid curriculum.' });
+    }
+
     log('/ai/curriculum/build', 200, Date.now()-t0, `lessons=${parsed?.curriculum?.lessons?.length ?? 0}`);
     res.json(parsed);
   } catch (e) {
@@ -203,14 +253,99 @@ RULES: exactly ${count} lessons, exactly 3 quiz questions each, total_xp = sum o
   }
 });
 
+// ── Expand a single unit's learn cards (called lazily when user opens a unit)
+app.post('/ai/curriculum/expand', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const topic       = strShort(req.body.topic,        'Programming');
+    const unitTitle   = strShort(req.body.unit_title,   '');
+    const unitSummary = strShort(req.body.unit_summary,  '');
+    const depth       = strShort(req.body.depth,        'beginner');
+    const style       = strShort(req.body.style,        'practical');
+
+    if (!unitTitle) return res.status(400).json({ error: 'unit_title is required.' });
+
+    const out = await ask(
+      `You are INDEX — an elite educator. Generate rich interactive learn cards for one unit of a course.
+Each card is shown to the learner BEFORE they take the quiz. Cards must build understanding progressively.
+Return ONLY valid JSON — no markdown fences, completely parseable.
+
+Card types:
+- concept: title + clear explanation (plain prose, 3-5 sentences)
+- keyFact: title + bullet list (format body as "• point1\n• point2\n• point3")
+- code: title + explanation + actual runnable code block
+- analogy: title + real-world comparison that makes the concept click
+- visual: title + explanation + visual_emojis array showing a flow or process
+
+Generate 4-6 learn cards for:
+Topic: "${topic}"
+Unit: "${unitTitle}"
+Summary: "${unitSummary}"
+Depth: ${depth} | Style: ${style}
+
+JSON:
+{
+  "learn_cards": [
+    {
+      "id": "card-1",
+      "type": "concept|keyFact|code|analogy|visual",
+      "title": "<card title>",
+      "body": "<explanation text>",
+      "code": "<actual code if type=code, else omit>",
+      "code_language": "<language if type=code, else omit>",
+      "visual_emojis": ["<emoji>","<emoji>","<emoji>"]
+    }
+  ]
+}
+
+RULES:
+- 4-6 cards minimum
+- If style=practical or topic involves code: include at least 1 code card with REAL runnable code
+- code cards: body explains what the code does, code field has actual code (15-40 lines)
+- analogy card: real-world comparison must be genuinely memorable and accurate
+- keyFact card: body must be "• point\n• point\n• point" format, 3-5 points
+- visual card: visual_emojis shows a process flow (3-5 emojis with logical sequence)
+- Build progressive understanding: start simple, get deeper
+- Each card must earn its place — no filler`,
+      `Expand unit "${unitTitle}" for topic "${topic}"`,
+      true, 2000, SMART
+    );
+
+    let parsed;
+    try { parsed = JSON.parse(out); } catch {
+      return res.status(502).json({ error: 'AI returned invalid learn cards.' });
+    }
+
+    log('/ai/curriculum/expand', 200, Date.now()-t0, `cards=${parsed?.learn_cards?.length ?? 0}`);
+    res.json(parsed);
+  } catch (e) {
+    log('/ai/curriculum/expand', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Unit expansion failed.' });
+  }
+});
+
+// ── Lesson chat
 app.post('/ai/curriculum/chat', requireAuth, aiLimiter, async (req, res) => {
   const t0 = Date.now();
   try {
-    const message        = strShort(req.body.message, '');
+    const message        = strShort(req.body.message,        '');
     const lesson_context = str(req.body.lesson_context, '').slice(0, 600);
-    const topic          = strShort(req.body.topic, '');
+    const topic          = strShort(req.body.topic,          '');
     if (!message) return res.status(400).json({ error: 'Message is required.' });
-    const reply = await ask(`You are INDEX AI — a sharp, direct tutor for "${topic}".\nLesson context: ${lesson_context}\nBe clear and specific. Max 150 words. Never cut off mid-sentence.`, message, false, 600, FAST);
+
+    const reply = await ask(
+      `You are INDEX AI — a sharp, direct tutor for "${topic}".
+Lesson context: ${lesson_context}
+
+Rules:
+- Be specific and concrete. Never vague.
+- Pattern: Explain → Example → Apply (how they'd use it in a real project).
+- If asked for resources: name SPECIFIC ones (exact book titles, exact URLs, exact course names).
+- Max 150 words. Never cut off mid-sentence.
+- No filler phrases like "great question!".`,
+      message, false, 600, FAST
+    );
+
     log('/ai/curriculum/chat', 200, Date.now()-t0);
     res.json({ reply });
   } catch (e) {
