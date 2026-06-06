@@ -1,803 +1,478 @@
 require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const crypto = require('crypto');
+const express    = require('express');
+const cors       = require('cors');
+const OpenAI     = require('openai');
+const rateLimit  = require('express-rate-limit');
+const helmet     = require('helmet');
+const bcrypt     = require('bcryptjs');
+const jwt        = require('jsonwebtoken');
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-
+const app  = express();
 const PORT = process.env.PORT || 3000;
-const PRINTIFY_BASE = 'https://api.printify.com/v1';
-const SHOP_ID = process.env.PRINTIFY_SHOP_ID;
-const SHOW_TAG = 'showfloor';
 
-// ── In-memory WARDROBE code store ─────────────────────────────────────────────
-// In production: move this to a database (Supabase, Railway Postgres, etc.)
-const WARDROBE_CODES = {};
-// Structure: { 'WARDROBE-X7K9-441': { productId, productName, orderId, email, createdAt, claimed, claimedAt } }
+app.use(helmet());
+app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
+app.use(express.json({ limit: '50kb' }));
+app.use(express.urlencoded({ extended: true, limit: '50kb' }));
 
-function pHeaders() {
-  return {
-    'Authorization': `Bearer ${process.env.PRINTIFY_API_KEY}`,
-    'Content-Type': 'application/json',
-    'User-Agent': '2AMStore/1.0',
-  };
+if (!process.env.OPENAI_API_KEY) {
+  console.error('FATAL: OPENAI_API_KEY not set');
+  process.exit(1);
+}
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 45000, maxRetries: 2 });
+
+const APP_SECRET = process.env.APP_SECRET || null;
+const JWT_SECRET = process.env.JWT_SECRET || 'grind_night_inc_2026';
+
+function requireAuth(req, res, next) {
+  if (!APP_SECRET) return next();
+  const secret = req.headers['x-app-secret'];
+  if (!secret || secret !== APP_SECRET) return res.status(401).json({ error: 'Unauthorized.' });
+  next();
 }
 
-// ── WARDROBE activation code generator ───────────────────────────────────────
-function generateWardrobeCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I, O, 0, 1 (confusing)
-  const seg = Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-  const num = Math.floor(Math.random() * 900 + 100); // 100-999
-  return `WARDROBE-${seg}-${num}`;
-}
+const globalLimiter = rateLimit({ windowMs: 15*60*1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests.' } });
+const aiLimiter     = rateLimit({ windowMs: 15*60*1000, max: 30,  standardHeaders: true, legacyHeaders: false, message: { error: 'AI limit reached. Try again soon.' } });
+const grindLimiter  = rateLimit({ windowMs: 15*60*1000, max: 60,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests.' } });
+app.use(globalLimiter);
 
-// ── Fetch all Printify products ───────────────────────────────────────────────
-async function fetchAllPrintifyProducts() {
-  let allProducts = [], page = 1, hasMore = true;
-  while (hasMore) {
-    const r = await fetch(`${PRINTIFY_BASE}/shops/${SHOP_ID}/products.json?limit=20&page=${page}`, { headers: pHeaders() });
-    if (!r.ok) throw new Error('Printify fetch failed');
-    const data = await r.json();
-    const batch = data.data || [];
-    allProducts = allProducts.concat(batch);
-    hasMore = batch.length === 20;
-    page++;
-    if (page > 10) break;
-  }
-  return allProducts;
-}
+const FAST  = 'gpt-4.1-mini';
+const SMART = 'gpt-4.1-mini';
 
-function shapeProduct(p, includeWardrobeData = false) {
-  const enabledVariants = (p.variants || []).filter(v => v.is_enabled !== false);
-  const cheapest = enabledVariants.length ? enabledVariants[0] : p.variants?.[0];
-  const rawPrice = cheapest?.price || 0;
-  const price = rawPrice > 500 ? (rawPrice / 100).toFixed(2) : rawPrice.toFixed(2);
-
-  const base = {
-    id: p.id,
-    name: p.title,
-    desc: (p.description || '').replace(/<[^>]*>/g, '').slice(0, 200),
-    price,
-    img: p.images?.[0]?.src || '',
-    images: (p.images || []).map(i => i.src),
-    variants: p.variants || [],
-    blueprintId: p.blueprint_id,
-    fulfillment: (p.tags || []).some(t => t.toLowerCase() === 'tapstitch') ? 'tapstitch' : 'printify',
-    badge: (p.tags || []).find(t => !['showfloor','tapstitch','iceman'].includes(t.toLowerCase()))?.toUpperCase() || 'NEW',
-    tag: p.tags?.find(t => !['showfloor','tapstitch'].includes(t.toLowerCase())) || '2AM Collection',
-    sizes: [...new Set((p.variants || []).map(v => v.title?.split(' / ')?.[0]).filter(Boolean))],
-    colors: [...new Set((p.variants || []).map(v => v.title?.split(' / ')?.[1]).filter(Boolean))],
-  };
-
-  // Extra fields for WARDROBE clothing recognition
-  if (includeWardrobeData) {
-    // Derive clothing type from name/tags
-    const nameLower = p.title.toLowerCase();
-    let clothingType = 'top';
-    if (nameLower.includes('hoodie') || nameLower.includes('sweatshirt')) clothingType = 'hoodie';
-    else if (nameLower.includes('tee') || nameLower.includes('t-shirt') || nameLower.includes('shirt')) clothingType = 'tee';
-    else if (nameLower.includes('case') || nameLower.includes('phone')) clothingType = 'accessory';
-    else if (nameLower.includes('pants') || nameLower.includes('jogger') || nameLower.includes('shorts')) clothingType = 'bottom';
-    else if (nameLower.includes('jacket') || nameLower.includes('coat')) clothingType = 'outerwear';
-    else if (nameLower.includes('hat') || nameLower.includes('cap')) clothingType = 'headwear';
-
-    // Derive collection
-    let collection = 'General';
-    if (nameLower.includes('iceman')) collection = 'Iceman';
-
-    // Color palette from variant names
-    const variantColors = base.colors.map(c => c.toLowerCase());
-
-    base.wardrobe = {
-      clothingType,
-      collection,
-      brand: '2AM',
-      colorPalette: variantColors,
-      // Keywords for AI matching — what words describe this piece visually
-      matchKeywords: [
-        p.title.toLowerCase(),
-        clothingType,
-        collection.toLowerCase(),
-        '2am',
-        ...variantColors,
-        ...(p.tags || []).map(t => t.toLowerCase()),
-      ].filter(Boolean),
-      // All product images for visual comparison
-      allImages: (p.images || []).map(i => i.src),
-      // Recommended pairings (simple rule-based for now)
-      recommendedPairings: clothingType === 'tee' || clothingType === 'hoodie'
-        ? ['cargo pants', 'joggers', 'jeans', 'white sneakers', 'black sneakers']
-        : clothingType === 'bottom'
-        ? ['graphic tee', 'hoodie', 'oversized shirt']
-        : [],
-    };
-  }
-
-  return base;
-}
-
-// ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'ok', store: '2AM', version: '2.0.0' }));
-
-// ══════════════════════════════════════════════════════════════════════════════
-// STORE — /api/products (showfloor only)
-// ══════════════════════════════════════════════════════════════════════════════
-app.get('/api/products', async (req, res) => {
-  try {
-    const allProducts = await fetchAllPrintifyProducts();
-    const products = allProducts
-      .filter(p => (p.tags || []).some(t => t.toLowerCase() === SHOW_TAG))
-      .map(p => shapeProduct(p, false));
-    res.json({ products, total: products.length });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// WARDROBE — /api/wardrobe/catalog
-// Full product catalog for clothing recognition — no showfloor filter,
-// includes extra wardrobe metadata. Protected by WARDROBE_API_KEY.
-// The APEX backend calls this to build its matching database.
-// ══════════════════════════════════════════════════════════════════════════════
-app.get('/api/wardrobe/catalog', async (req, res) => {
-  // Check WARDROBE API key — set WARDROBE_API_KEY in Railway env vars
-  const key = req.headers['x-wardrobe-key'];
-  if (process.env.WARDROBE_API_KEY && key !== process.env.WARDROBE_API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  try {
-    const allProducts = await fetchAllPrintifyProducts();
-    // Return ALL products (no showfloor filter) with full wardrobe metadata
-    const products = allProducts.map(p => shapeProduct(p, true));
-    res.json({
-      brand: '2AM',
-      totalProducts: products.length,
-      lastUpdated: new Date().toISOString(),
-      products,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// WARDROBE — /api/wardrobe/validate-code
-// WARDROBE app calls this to validate and claim an activation code
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/wardrobe/validate-code', async (req, res) => {
-  const { code, userId } = req.body;
-  if (!code) return res.status(400).json({ error: 'Code required' });
-
-  const normalizedCode = code.trim().toUpperCase();
-  const record = WARDROBE_CODES[normalizedCode];
-
-  if (!record) return res.status(404).json({ error: 'Invalid code. Check for typos.' });
-  if (record.claimed) return res.status(409).json({ error: 'This code has already been used.' });
-
-  // Mark as claimed
-  WARDROBE_CODES[normalizedCode].claimed = true;
-  WARDROBE_CODES[normalizedCode].claimedAt = new Date().toISOString();
-  WARDROBE_CODES[normalizedCode].claimedBy = userId || 'unknown';
-
-  console.log(`✅ WARDROBE code claimed: ${normalizedCode} by ${userId}`);
-
-  // Return the product data for WARDROBE to create the incoming item
-  res.json({
-    success: true,
-    code: normalizedCode,
-    product: {
-      id: record.productId,
-      name: record.productName,
-      collection: record.collection || '2AM',
-      img: record.productImg,
-      images: record.productImages || [],
-      colors: record.productColors || [],
-      clothingType: record.clothingType || 'top',
-      price: record.price,
-      size: record.size,
-      color: record.color,
-      orderId: record.orderId,
-    },
+async function ask(system, user, json = false, maxTokens = 800, model = FAST) {
+  const res = await openai.chat.completions.create({
+    model, max_tokens: maxTokens,
+    response_format: json ? { type: 'json_object' } : undefined,
+    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
   });
-});
+  return res.choices[0].message.content;
+}
+
+function str(val, fallback = '')      { return typeof val !== 'string' ? fallback : val.trim().slice(0, 2000); }
+function strShort(val, fallback = '') { return typeof val !== 'string' ? fallback : val.trim().slice(0, 200); }
+function safeArray(val, limit = 20)   { return !Array.isArray(val) ? [] : val.slice(0, limit).map(i => String(i).trim().slice(0, 200)); }
+function log(route, status, ms, extra = '') { console.log(`[${new Date().toISOString()}] ${route} ${status} ${ms}ms ${extra}`); }
+
+// ─── Health ───────────────────────────────────────────────────────────────────
+app.get('/', (_, res) => res.json({
+  status: 'NIGHT_INC_ONLINE', version: '3.2.0',
+  apps: ['APX','INDEX','NEXUS','KINETIC','AURA','DECK','WARDROBE','GRIND'],
+}));
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SHIPPING
+// APX — POST /schedule
 // ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/calculate-shipping', async (req, res) => {
-  const { items, shippingAddress } = req.body;
-  if (!items?.length || !shippingAddress?.zip) {
-    return res.status(400).json({ error: 'Missing items or address' });
-  }
-  const itemCount = items.length;
-  const isUS = !shippingAddress.country || shippingAddress.country === 'US';
-  const shippingCents = isUS
-    ? 499 + Math.max(0, itemCount - 1) * 150
-    : 1499 + Math.max(0, itemCount - 1) * 300;
-  const subtotalCents = items.reduce((s, i) => s + Math.round(Number(i.price) * 100), 0);
-  const totalCents = subtotalCents + shippingCents;
-  res.json({
-    subtotal: (subtotalCents / 100).toFixed(2),
-    shipping: (shippingCents / 100).toFixed(2),
-    tax: '0.00',
-    total: (totalCents / 100).toFixed(2),
-    totalCents,
-  });
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// PAYMENT INTENT
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/create-payment-intent', async (req, res) => {
-  const { items, email, shippingAddress } = req.body;
-  if (!items?.length) return res.status(400).json({ error: 'No items' });
-  const subtotalCents = items.reduce((s, i) => s + Math.round(Number(i.price) * 100), 0);
-  const isUS = !shippingAddress?.country || shippingAddress?.country === 'US';
-  const shippingCents = isUS
-    ? 499 + Math.max(0, items.length - 1) * 150
-    : 1499 + Math.max(0, items.length - 1) * 300;
-  const totalCents = subtotalCents + shippingCents;
+app.post('/schedule', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
   try {
-    const intent = await stripe.paymentIntents.create({
-      amount: totalCents,
-      currency: 'usd',
-      receipt_email: email || undefined,
-      automatic_payment_methods: { enabled: true },
-      metadata: { store: '2AM', itemCount: String(items.length) },
-    });
-    res.json({
-      clientSecret: intent.client_secret,
-      subtotal: (subtotalCents / 100).toFixed(2),
-      shipping: (shippingCents / 100).toFixed(2),
-      total: (totalCents / 100).toFixed(2),
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    const username    = strShort(req.body.username,    'OPERATOR');
+    const tasks       = safeArray(req.body.tasks, 12);
+    const wakeTime    = strShort(req.body.wakeTime,    '6:30 AM');
+    const sleepTime   = strShort(req.body.sleepTime,   '10:30 PM');
+    const notes       = strShort(req.body.notes,       '');
+    const date        = strShort(req.body.date,        '');
+    const currentTime = strShort(req.body.currentTime, '');
+    const currentDay  = strShort(req.body.currentDay,  '');
+    const profileAge          = strShort(req.body.profileAge,          '');
+    const profileSchool       = strShort(req.body.profileSchool,       '');
+    const profileSports       = strShort(req.body.profileSports,       '');
+    const profilePracticeDays = strShort(req.body.profilePracticeDays, '');
+    const profilePracticeTime = strShort(req.body.profilePracticeTime, '');
+    const profileBusiness     = strShort(req.body.profileBusiness,     '');
+    const profileGoals        = strShort(req.body.profileGoals,        '');
+    const profileOther        = strShort(req.body.profileOther,        '');
+    const profileSchedule     = str(req.body.profileSchedule, '');
+    const profileContext      = str(req.body.profileContext,   '');
+
+    const taskList = tasks.length ? tasks.map((t,i) => `${i+1}. ${t}`).join('\n') : 'General high-performance day.';
+    const constraints = [];
+    if (profileSchedule) constraints.push(`FIXED SCHEDULE (use exact times for ${currentDay}):\n${profileSchedule}`);
+    else if (profileContext) constraints.push(`PROFILE & SCHEDULE:\n${profileContext}`);
+    if (profilePracticeDays && profilePracticeTime) constraints.push(`PRACTICE: ${profilePracticeDays} at ${profilePracticeTime} — NON-NEGOTIABLE`);
+    const fixedBlock = constraints.length ? `⚠️ FIXED CONSTRAINTS — respect exactly:\n${constraints.join('\n\n')}\n` : '';
+    const personalLines = [
+      profileAge && `Age: ${profileAge}`, profileSchool && `School: ${profileSchool}`,
+      profileSports && `Sports: ${profileSports}`, profileBusiness && `Business: ${profileBusiness}`,
+      profileGoals && `Goals: ${profileGoals}`, profileOther && `Other: ${profileOther}`,
+    ].filter(Boolean).join(' | ');
+
+    const out = await ask(
+      `You are APEX AI — an elite daily scheduler for high-performance people of any age, background, or lifestyle.
+
+Your job: read the user's profile, fixed schedule, and tasks — then build the best possible day around their real life.
+
+HOW TO READ THE CONTEXT:
+• If a fixed schedule is provided — treat those times as NON-NEGOTIABLE. Build everything else around them.
+• If sports or training is listed — include a workout block with specifics matching their sport/fitness level.
+• If a business or project is listed — include focused work blocks for it.
+• If a sleep time is set — that is the hard stop. Nothing after it.
+• Respect the user's actual life. A student has school. An athlete has practice. A founder has brand work.
+
+RULES:
+1. Fixed commitments are sacred — never schedule over them
+2. Fill EVERY hour from wake to sleep — zero gaps, zero truncation
+3. Activities must be SPECIFIC — exact exercises/sets/reps, exact tasks, exact actions. Never vague.
+4. Minimum 8 blocks, as many as needed to cover the full day
+5. Return ONLY valid JSON — complete every block, never stop early
+
+CATEGORIES: ops, fitness, study, biz, church, rest`,
+      `OPERATOR: ${username}
+DATE: ${date} ${currentDay} | NOW: ${currentTime}
+WAKE: ${wakeTime} → SLEEP: ${sleepTime}
+${personalLines ? `ABOUT: ${personalLines}` : ''}
+
+${fixedBlock}
+NOTES: ${notes || 'none'}
+
+TASKS TO FIT IN TODAY:
+${taskList}
+
+JSON (cover every hour ${wakeTime}→${sleepTime}, min 8 blocks):
+{"success":true,"data":{"summary":"<one punchy sentence>","totalXP":<sum>,"blocks":[{"time":"<h:mm AM/PM>","duration":"<X min>","activity":"<SPECIFIC>","category":"<ops|fitness|study|biz|church|rest>","xp":<50-300>}]}}`,
+      true, 2500, SMART
+    );
+    let parsed;
+    try { parsed = JSON.parse(out); } catch { return res.status(502).json({ success: false, data: null, error: 'AI returned invalid response.' }); }
+    log('/schedule', 200, Date.now()-t0, `blocks=${parsed?.data?.blocks?.length ?? 0}`);
+    res.json(parsed);
+  } catch (e) {
+    log('/schedule', 500, Date.now()-t0, e.message);
+    res.status(500).json({ success: false, data: null, error: 'Schedule generation failed.' });
   }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// PAYMENT CONFIRM — generates WARDROBE code per item
+// APX — Finance
 // ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/payment', async (req, res) => {
-  const { paymentIntentId, items, shippingAddress, email } = req.body;
-  if (!paymentIntentId || !items?.length) return res.status(400).json({ error: 'Missing data' });
+app.post('/apx/finance/split', requireAuth, (req, res) => {
+  const amt = parseFloat(req.body.income);
+  if (isNaN(amt) || amt < 0 || amt > 1_000_000) return res.status(400).json({ error: 'Invalid income value.' });
+  res.json({ total: amt, split: { reinvestment: +(amt*0.80).toFixed(2), investing: +(amt*0.08).toFixed(2), savings: +(amt*0.07).toFixed(2), tools: +(amt*0.03).toFixed(2), personal: +(amt*0.02).toFixed(2) } });
+});
+
+app.post('/apx/finance/advice', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
   try {
-    const intent = await stripe.paymentIntents.retrieve(paymentIntentId);
-    if (intent.status !== 'succeeded') return res.status(400).json({ error: 'Payment not confirmed' });
-    console.log('✅ Stripe payment:', paymentIntentId);
+    const message = strShort(req.body.message, '');
+    const entries = safeArray(req.body.entries, 10).map(e => (typeof e === 'object' ? `${e.type}: $${e.amount} (${e.label})` : String(e)));
+    if (!message) return res.status(400).json({ error: 'Message is required.' });
+    const reply = await ask('APX finance advisor for a teen entrepreneur. Direct, specific, real numbers. Max 120 words.', `Log:\n${entries.join('\n') || 'none'}\nQuestion: ${message}`, false, 400, FAST);
+    log('/apx/finance/advice', 200, Date.now()-t0);
+    res.json({ advice: reply });
+  } catch (e) {
+    log('/apx/finance/advice', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Finance advice unavailable.' });
+  }
+});
 
-    const printifyItems = items.filter(i => i.fulfillment !== 'tapstitch');
-    const tapstitchItems = items.filter(i => i.fulfillment === 'tapstitch');
+// ══════════════════════════════════════════════════════════════════════════════
+// INDEX — Curriculum
+// ══════════════════════════════════════════════════════════════════════════════
+app.post('/ai/curriculum/build', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const topic = strShort(req.body.topic, 'Programming');
+    const depth = strShort(req.body.depth, 'beginner');
+    const style = strShort(req.body.style, 'practical');
+    const count = Math.min(Math.max(parseInt(req.body.lesson_count) || 5, 1), 10);
+    if (!topic) return res.status(400).json({ error: 'Topic is required.' });
+    const safeDepth = ['beginner','intermediate','advanced'].includes(depth) ? depth : 'beginner';
+    const safeStyle = ['practical','theoretical','project'].includes(style) ? style : 'practical';
+    const styleGuide = safeStyle==='practical' ? 'Lead with real working code/examples. Explain every step.' : safeStyle==='theoretical' ? 'Build intuition first with sharp analogies. Then formalize.' : 'Every lesson = one concrete step toward a finished project.';
+    const depthGuide = safeDepth==='beginner' ? 'Zero prior knowledge assumed. Plain language.' : safeDepth==='intermediate' ? 'Basics assumed. Go deep on mechanics and edge cases.' : 'Strong foundation assumed. Advanced patterns and production thinking.';
+    const out = await ask(
+      `You are INDEX — an elite curriculum builder. ${styleGuide} ${depthGuide}
+Write like a brilliant mentor to a sharp 16-year-old who learns fast.
+Each lesson needs one clear aha moment. Use real examples, real code, real analogies.
+Return ONLY valid JSON — no markdown fences, completely parseable. Complete all lessons fully.`,
+      `Build a ${count}-lesson curriculum on: "${topic}"
 
-    let printifyOrderId = null;
-    let tapstitchOrderId = null;
+JSON:
+{"curriculum":{"id":"curriculum-1","topic":"${topic}","tagline":"<what student will DO — specific>","total_xp":<sum>,"earned_xp":0,"lessons":[{"id":"lesson-1","title":"<compelling title>","emoji":"<emoji>","summary":"<one sentence hinting at aha moment>","content":"<rich markdown 200-350 words: headers, bullets, code blocks>","key_points":["<real insight>","<real insight>","<real insight>"],"xp":<100-200>,"completed":false,"quiz_passed":false,"quiz":[{"id":"q-1-1","question":"<tests real understanding>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},{"id":"q-1-2","question":"<different concept>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},{"id":"q-1-3","question":"<practical application>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null}]}]}}
 
-    // ── PRINTIFY ──────────────────────────────────────────
-    if (printifyItems.length && shippingAddress) {
-      const pr = await fetch(`${PRINTIFY_BASE}/shops/${SHOP_ID}/orders.json`, {
-        method: 'POST',
-        headers: pHeaders(),
-        body: JSON.stringify({
-          external_id: `2am-${paymentIntentId}`,
-          label: '2AM Order',
-          line_items: printifyItems.map(i => ({
-            product_id: i.id,
-            variant_id: i.variantId,
-            quantity: 1,
-          })),
-          shipping_method: 1,
-          send_shipping_notification: true,
-          address_to: {
-            first_name: shippingAddress.firstName,
-            last_name: shippingAddress.lastName,
-            email: email || '',
-            phone: shippingAddress.phone || '',
-            country: shippingAddress.country || 'US',
-            region: shippingAddress.state,
-            address1: shippingAddress.line1,
-            address2: shippingAddress.line2 || '',
-            city: shippingAddress.city,
-            zip: shippingAddress.zip,
-          },
-        }),
-      });
-      if (pr.ok) {
-        const po = await pr.json();
-        printifyOrderId = po.id;
-        console.log('✅ Printify order:', printifyOrderId);
-      } else {
-        console.error('⚠️ Printify failed:', await pr.text());
+RULES: exactly ${count} lessons, exactly 3 quiz questions each, total_xp = sum of xp. Do NOT truncate.`,
+      true, 6000, SMART
+    );
+    let parsed;
+    try { parsed = JSON.parse(out); } catch { return res.status(502).json({ error: 'AI returned invalid curriculum.' }); }
+    log('/ai/curriculum/build', 200, Date.now()-t0, `lessons=${parsed?.curriculum?.lessons?.length ?? 0}`);
+    res.json(parsed);
+  } catch (e) {
+    log('/ai/curriculum/build', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Curriculum build failed.' });
+  }
+});
+
+app.post('/ai/curriculum/chat', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const message        = strShort(req.body.message, '');
+    const lesson_context = str(req.body.lesson_context, '').slice(0, 600);
+    const topic          = strShort(req.body.topic, '');
+    if (!message) return res.status(400).json({ error: 'Message is required.' });
+    const reply = await ask(`You are INDEX AI — a sharp, direct tutor for "${topic}".\nLesson context: ${lesson_context}\nBe clear and specific. Max 150 words. Never cut off mid-sentence.`, message, false, 600, FAST);
+    log('/ai/curriculum/chat', 200, Date.now()-t0);
+    res.json({ reply });
+  } catch (e) {
+    log('/ai/curriculum/chat', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Tutor unavailable.' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// NEXUS + KINETIC + AURA + DECK — POST /api/chat
+// ══════════════════════════════════════════════════════════════════════════════
+app.post('/api/chat', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const system   = str(req.body.system, '').slice(0, 800);
+    const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
+    if (!messages.length) return res.status(400).json({ error: 'Messages array is required.' });
+    const history = messages.slice(-6)
+      .filter(m => m && typeof m.role === 'string' && typeof m.content === 'string')
+      .map(m => ({ role: ['user','assistant','system'].includes(m.role) ? m.role : 'user', content: String(m.content).slice(0, 1000) }));
+    if (!history.length) return res.status(400).json({ error: 'No valid messages provided.' });
+    const completion = await openai.chat.completions.create({
+      model: FAST, max_tokens: 800,
+      messages: [{ role: 'system', content: system + '\n\nAlways complete your full response. Never cut off mid-sentence.' }, ...history],
+    });
+    log('/api/chat', 200, Date.now()-t0);
+    res.json({ reply: completion.choices[0].message.content });
+  } catch (e) {
+    log('/api/chat', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'AI unavailable.' });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WARDROBE — POST /api/outfits
+// Smart randomizer — picks pieces by role + color harmony, AI writes description only
+// ══════════════════════════════════════════════════════════════════════════════
+app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const items          = Array.isArray(req.body.items) ? req.body.items.slice(0, 100) : [];
+    const occasion       = strShort(req.body.occasion, 'casual');
+    const weather        = strShort(req.body.weather,  'mild');
+    const notes          = strShort(req.body.notes,    '').toLowerCase();
+    const previousCombos = Array.isArray(req.body.previousCombos) ? req.body.previousCombos.slice(0, 50) : [];
+
+    if (items.length < 2) return res.status(400).json({ error: 'Add at least 2 items to your closet.' });
+
+    const byRole = { top: [], bottom: [], shoes: [], layer: [] };
+    const TOP_TYPES    = ['tee','hoodie','shirt','top','crewneck','longsleeve','tank','jersey','sweater','sweatshirt'];
+    const BOTTOM_TYPES = ['pants','jeans','shorts','sweats','cargo','trousers','joggers','skirt','chinos','denim'];
+    const SHOE_TYPES   = ['footwear','shoes','sneakers','boots','slides','sandals','jordan','nike','adidas','air force','dunks','yeezy','loafer','runner'];
+    const LAYER_TYPES  = ['jacket','coat','zip','vest','blazer','windbreaker','puffer','fleece'];
+
+    function getName(it)  { return typeof it === 'object' ? (it.name  || 'item') : String(it); }
+    function getColor(it) { return typeof it === 'object' ? (it.color || 'grey') : 'grey'; }
+    function getType(it)  { return typeof it === 'object' ? (it.type  || '')     : ''; }
+
+    for (const it of items) {
+      const type     = getType(it).toLowerCase();
+      const name     = getName(it).toLowerCase();
+      const combined = `${type} ${name}`;
+      if      (SHOE_TYPES  .some(k => combined.includes(k))) byRole.shoes .push(it);
+      else if (BOTTOM_TYPES.some(k => combined.includes(k))) byRole.bottom.push(it);
+      else if (LAYER_TYPES .some(k => combined.includes(k))) byRole.layer .push(it);
+      else                                                    byRole.top   .push(it);
+    }
+
+    if (!byRole.top.length)    return res.status(400).json({ error: 'No tops found. Add a tee, hoodie, or shirt.' });
+    if (!byRole.bottom.length) return res.status(400).json({ error: 'No bottoms found. Add pants or jeans.' });
+    if (!byRole.shoes.length)  return res.status(400).json({ error: 'No shoes found. Add sneakers or boots.' });
+
+    const coreCount    = byRole.top.length + byRole.bottom.length + byRole.shoes.length;
+    const banThreshold = coreCount <= 6 ? 1 : 2;
+    const bannedSets   = previousCombos.map(c => new Set((Array.isArray(c) ? c : [c]).map(n => n.toLowerCase().trim())));
+
+    function isBanned(pieces) {
+      const nameSet = new Set(pieces.map(p => getName(p).toLowerCase().trim()));
+      return bannedSets.some(banned => { let o = 0; for (const n of banned) { if (nameSet.has(n)) o++; } return o >= banThreshold; });
+    }
+    function shuffle(arr) {
+      const a = [...arr];
+      for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+      return a;
+    }
+    function hexToRgb(color) {
+      const nameMap = { black:'#111111',white:'#f5f5f0',grey:'#888888',gray:'#888888',navy:'#1b2a4a',blue:'#2563eb',red:'#dc2626',green:'#16a34a',brown:'#92400e',beige:'#d4c5a9',cream:'#fef3c7',orange:'#ea580c',purple:'#7c3aed',pink:'#f472b6',yellow:'#eab308',olive:'#4d7c0f',tan:'#d97706',camel:'#b45309',rust:'#b45309',burgundy:'#7f1d1d',charcoal:'#374151',slate:'#64748b',khaki:'#bdb76b',stone:'#a8a29e' };
+      let hex = color.toLowerCase().startsWith('#') ? color : (nameMap[color.toLowerCase()] || '#888888');
+      hex = hex.replace('#', ''); if (hex.length === 3) hex = hex.split('').map(c => c+c).join('');
+      const n = parseInt(hex, 16); return { r: (n>>16)&255, g: (n>>8)&255, b: n&255 };
+    }
+    function harmonyScore(pieces) {
+      if (pieces.length < 2) return 70;
+      const rgbs = pieces.map(p => hexToRgb(getColor(p))); let total = 0, pairs = 0;
+      for (let i = 0; i < rgbs.length; i++) for (let j = i+1; j < rgbs.length; j++) {
+        const d = Math.sqrt((rgbs[i].r-rgbs[j].r)**2+(rgbs[i].g-rgbs[j].g)**2+(rgbs[i].b-rgbs[j].b)**2)/441.7;
+        total += d < 0.15 ? 95 : d > 0.55 ? 88 : Math.max(30, 85 - d*100); pairs++;
       }
+      return Math.round(total / pairs);
     }
-
-    // ── TAPSTITCH ─────────────────────────────────────────
-    if (tapstitchItems.length) {
-      tapstitchOrderId = `ts-${paymentIntentId}`;
-      console.log('🧵 TapStitch order:', {
-        orderId: tapstitchOrderId,
-        customer: { email, ...shippingAddress },
-        items: tapstitchItems.map(i => ({ name: i.name, size: i.size, color: i.color, notes: i.notes, price: i.price })),
-      });
-    }
-
-    // ── GENERATE WARDROBE ACTIVATION CODES ───────────────
-    // One code per item purchased — customer enters each in WARDROBE
-    const wardrobeCodes = items.map(item => {
-      const code = generateWardrobeCode();
-
-      // Determine clothing type from product name
-      const nameLower = (item.name || '').toLowerCase();
-      let clothingType = 'top';
-      if (nameLower.includes('hoodie') || nameLower.includes('sweatshirt')) clothingType = 'hoodie';
-      else if (nameLower.includes('tee') || nameLower.includes('t-shirt') || nameLower.includes('shirt')) clothingType = 'tee';
-      else if (nameLower.includes('case') || nameLower.includes('phone')) clothingType = 'accessory';
-      else if (nameLower.includes('pants') || nameLower.includes('jogger')) clothingType = 'bottom';
-      else if (nameLower.includes('jacket') || nameLower.includes('coat')) clothingType = 'outerwear';
-
-      let collection = 'General';
-      if (nameLower.includes('iceman')) collection = 'Iceman';
-
-      // Store the code record
-      WARDROBE_CODES[code] = {
-        productId: item.id,
-        productName: item.name,
-        productImg: item.img,
-        productImages: item.images || [],
-        productColors: item.colors || [],
-        clothingType,
-        collection,
-        price: item.price,
-        size: item.size,
-        color: item.color,
-        orderId: printifyOrderId || tapstitchOrderId,
-        email,
-        createdAt: new Date().toISOString(),
-        claimed: false,
-        claimedAt: null,
-        claimedBy: null,
-      };
-
-      console.log(`🎟️ WARDROBE code generated: ${code} for "${item.name}"`);
-
-      return {
-        code,
-        productName: item.name,
-        productImg: item.img,
-      };
-    });
-
-    res.json({
-      success: true,
-      paymentIntentId,
-      printifyOrderId,
-      tapstitchOrderId,
-      // ← these codes go in the order confirmation email / page
-      wardrobeCodes,
-      wardrobeMessage: wardrobeCodes.length > 0
-        ? `You have ${wardrobeCodes.length} WARDROBE activation code${wardrobeCodes.length > 1 ? 's' : ''}. Open WARDROBE → Add Clothes → Enter Code to track your 2AM items.`
-        : null,
-    });
-  } catch (err) {
-    console.error('Payment error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// DROP SIGNUP
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/drop-signup', (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'No email' });
-  console.log('📧 Drop signup:', email);
-  res.json({ success: true });
-});
-
-app.listen(PORT, () => console.log(`2AM backend on port ${PORT}`));require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const crypto = require('crypto');
-
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-
-const PORT = process.env.PORT || 3000;
-const PRINTIFY_BASE = 'https://api.printify.com/v1';
-const SHOP_ID = process.env.PRINTIFY_SHOP_ID;
-const SHOW_TAG = 'showfloor';
-
-// ── In-memory WARDROBE code store ─────────────────────────────────────────────
-// In production: move this to a database (Supabase, Railway Postgres, etc.)
-const WARDROBE_CODES = {};
-// Structure: { 'WARDROBE-X7K9-441': { productId, productName, orderId, email, createdAt, claimed, claimedAt } }
-
-function pHeaders() {
-  return {
-    'Authorization': `Bearer ${process.env.PRINTIFY_API_KEY}`,
-    'Content-Type': 'application/json',
-    'User-Agent': '2AMStore/1.0',
-  };
-}
-
-// ── WARDROBE activation code generator ───────────────────────────────────────
-function generateWardrobeCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no I, O, 0, 1 (confusing)
-  const seg = Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-  const num = Math.floor(Math.random() * 900 + 100); // 100-999
-  return `WARDROBE-${seg}-${num}`;
-}
-
-// ── Fetch all Printify products ───────────────────────────────────────────────
-async function fetchAllPrintifyProducts() {
-  let allProducts = [], page = 1, hasMore = true;
-  while (hasMore) {
-    const r = await fetch(`${PRINTIFY_BASE}/shops/${SHOP_ID}/products.json?limit=20&page=${page}`, { headers: pHeaders() });
-    if (!r.ok) throw new Error('Printify fetch failed');
-    const data = await r.json();
-    const batch = data.data || [];
-    allProducts = allProducts.concat(batch);
-    hasMore = batch.length === 20;
-    page++;
-    if (page > 10) break;
-  }
-  return allProducts;
-}
-
-function shapeProduct(p, includeWardrobeData = false) {
-  const enabledVariants = (p.variants || []).filter(v => v.is_enabled !== false);
-  const cheapest = enabledVariants.length ? enabledVariants[0] : p.variants?.[0];
-  const rawPrice = cheapest?.price || 0;
-  const price = rawPrice > 500 ? (rawPrice / 100).toFixed(2) : rawPrice.toFixed(2);
-
-  const base = {
-    id: p.id,
-    name: p.title,
-    desc: (p.description || '').replace(/<[^>]*>/g, '').slice(0, 200),
-    price,
-    img: p.images?.[0]?.src || '',
-    images: (p.images || []).map(i => i.src),
-    variants: p.variants || [],
-    blueprintId: p.blueprint_id,
-    fulfillment: (p.tags || []).some(t => t.toLowerCase() === 'tapstitch') ? 'tapstitch' : 'printify',
-    badge: (p.tags || []).find(t => !['showfloor','tapstitch','iceman'].includes(t.toLowerCase()))?.toUpperCase() || 'NEW',
-    tag: p.tags?.find(t => !['showfloor','tapstitch'].includes(t.toLowerCase())) || '2AM Collection',
-    sizes: [...new Set((p.variants || []).map(v => v.title?.split(' / ')?.[0]).filter(Boolean))],
-    colors: [...new Set((p.variants || []).map(v => v.title?.split(' / ')?.[1]).filter(Boolean))],
-  };
-
-  // Extra fields for WARDROBE clothing recognition
-  if (includeWardrobeData) {
-    // Derive clothing type from name/tags
-    const nameLower = p.title.toLowerCase();
-    let clothingType = 'top';
-    if (nameLower.includes('hoodie') || nameLower.includes('sweatshirt')) clothingType = 'hoodie';
-    else if (nameLower.includes('tee') || nameLower.includes('t-shirt') || nameLower.includes('shirt')) clothingType = 'tee';
-    else if (nameLower.includes('case') || nameLower.includes('phone')) clothingType = 'accessory';
-    else if (nameLower.includes('pants') || nameLower.includes('jogger') || nameLower.includes('shorts')) clothingType = 'bottom';
-    else if (nameLower.includes('jacket') || nameLower.includes('coat')) clothingType = 'outerwear';
-    else if (nameLower.includes('hat') || nameLower.includes('cap')) clothingType = 'headwear';
-
-    // Derive collection
-    let collection = 'General';
-    if (nameLower.includes('iceman')) collection = 'Iceman';
-
-    // Color palette from variant names
-    const variantColors = base.colors.map(c => c.toLowerCase());
-
-    base.wardrobe = {
-      clothingType,
-      collection,
-      brand: '2AM',
-      colorPalette: variantColors,
-      // Keywords for AI matching — what words describe this piece visually
-      matchKeywords: [
-        p.title.toLowerCase(),
-        clothingType,
-        collection.toLowerCase(),
-        '2am',
-        ...variantColors,
-        ...(p.tags || []).map(t => t.toLowerCase()),
-      ].filter(Boolean),
-      // All product images for visual comparison
-      allImages: (p.images || []).map(i => i.src),
-      // Recommended pairings (simple rule-based for now)
-      recommendedPairings: clothingType === 'tee' || clothingType === 'hoodie'
-        ? ['cargo pants', 'joggers', 'jeans', 'white sneakers', 'black sneakers']
-        : clothingType === 'bottom'
-        ? ['graphic tee', 'hoodie', 'oversized shirt']
-        : [],
-    };
-  }
-
-  return base;
-}
-
-// ─── HEALTH ───────────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'ok', store: '2AM', version: '2.0.0' }));
-
-// ══════════════════════════════════════════════════════════════════════════════
-// STORE — /api/products (showfloor only)
-// ══════════════════════════════════════════════════════════════════════════════
-app.get('/api/products', async (req, res) => {
-  try {
-    const allProducts = await fetchAllPrintifyProducts();
-    const products = allProducts
-      .filter(p => (p.tags || []).some(t => t.toLowerCase() === SHOW_TAG))
-      .map(p => shapeProduct(p, false));
-    res.json({ products, total: products.length });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// WARDROBE — /api/wardrobe/catalog
-// Full product catalog for clothing recognition — no showfloor filter,
-// includes extra wardrobe metadata. Protected by WARDROBE_API_KEY.
-// The APEX backend calls this to build its matching database.
-// ══════════════════════════════════════════════════════════════════════════════
-app.get('/api/wardrobe/catalog', async (req, res) => {
-  // Check WARDROBE API key — set WARDROBE_API_KEY in Railway env vars
-  const key = req.headers['x-wardrobe-key'];
-  if (process.env.WARDROBE_API_KEY && key !== process.env.WARDROBE_API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  try {
-    const allProducts = await fetchAllPrintifyProducts();
-    // Return ALL products (no showfloor filter) with full wardrobe metadata
-    const products = allProducts.map(p => shapeProduct(p, true));
-    res.json({
-      brand: '2AM',
-      totalProducts: products.length,
-      lastUpdated: new Date().toISOString(),
-      products,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// WARDROBE — /api/wardrobe/validate-code
-// WARDROBE app calls this to validate and claim an activation code
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/wardrobe/validate-code', async (req, res) => {
-  const { code, userId } = req.body;
-  if (!code) return res.status(400).json({ error: 'Code required' });
-
-  const normalizedCode = code.trim().toUpperCase();
-  const record = WARDROBE_CODES[normalizedCode];
-
-  if (!record) return res.status(404).json({ error: 'Invalid code. Check for typos.' });
-  if (record.claimed) return res.status(409).json({ error: 'This code has already been used.' });
-
-  // Mark as claimed
-  WARDROBE_CODES[normalizedCode].claimed = true;
-  WARDROBE_CODES[normalizedCode].claimedAt = new Date().toISOString();
-  WARDROBE_CODES[normalizedCode].claimedBy = userId || 'unknown';
-
-  console.log(`✅ WARDROBE code claimed: ${normalizedCode} by ${userId}`);
-
-  // Return the product data for WARDROBE to create the incoming item
-  res.json({
-    success: true,
-    code: normalizedCode,
-    product: {
-      id: record.productId,
-      name: record.productName,
-      collection: record.collection || '2AM',
-      img: record.productImg,
-      images: record.productImages || [],
-      colors: record.productColors || [],
-      clothingType: record.clothingType || 'top',
-      price: record.price,
-      size: record.size,
-      color: record.color,
-      orderId: record.orderId,
-    },
-  });
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// SHIPPING
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/calculate-shipping', async (req, res) => {
-  const { items, shippingAddress } = req.body;
-  if (!items?.length || !shippingAddress?.zip) {
-    return res.status(400).json({ error: 'Missing items or address' });
-  }
-  const itemCount = items.length;
-  const isUS = !shippingAddress.country || shippingAddress.country === 'US';
-  const shippingCents = isUS
-    ? 499 + Math.max(0, itemCount - 1) * 150
-    : 1499 + Math.max(0, itemCount - 1) * 300;
-  const subtotalCents = items.reduce((s, i) => s + Math.round(Number(i.price) * 100), 0);
-  const totalCents = subtotalCents + shippingCents;
-  res.json({
-    subtotal: (subtotalCents / 100).toFixed(2),
-    shipping: (shippingCents / 100).toFixed(2),
-    tax: '0.00',
-    total: (totalCents / 100).toFixed(2),
-    totalCents,
-  });
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// PAYMENT INTENT
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/create-payment-intent', async (req, res) => {
-  const { items, email, shippingAddress } = req.body;
-  if (!items?.length) return res.status(400).json({ error: 'No items' });
-  const subtotalCents = items.reduce((s, i) => s + Math.round(Number(i.price) * 100), 0);
-  const isUS = !shippingAddress?.country || shippingAddress?.country === 'US';
-  const shippingCents = isUS
-    ? 499 + Math.max(0, items.length - 1) * 150
-    : 1499 + Math.max(0, items.length - 1) * 300;
-  const totalCents = subtotalCents + shippingCents;
-  try {
-    const intent = await stripe.paymentIntents.create({
-      amount: totalCents,
-      currency: 'usd',
-      receipt_email: email || undefined,
-      automatic_payment_methods: { enabled: true },
-      metadata: { store: '2AM', itemCount: String(items.length) },
-    });
-    res.json({
-      clientSecret: intent.client_secret,
-      subtotal: (subtotalCents / 100).toFixed(2),
-      shipping: (shippingCents / 100).toFixed(2),
-      total: (totalCents / 100).toFixed(2),
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// PAYMENT CONFIRM — generates WARDROBE code per item
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/payment', async (req, res) => {
-  const { paymentIntentId, items, shippingAddress, email } = req.body;
-  if (!paymentIntentId || !items?.length) return res.status(400).json({ error: 'Missing data' });
-  try {
-    const intent = await stripe.paymentIntents.retrieve(paymentIntentId);
-    if (intent.status !== 'succeeded') return res.status(400).json({ error: 'Payment not confirmed' });
-    console.log('✅ Stripe payment:', paymentIntentId);
-
-    const printifyItems = items.filter(i => i.fulfillment !== 'tapstitch');
-    const tapstitchItems = items.filter(i => i.fulfillment === 'tapstitch');
-
-    let printifyOrderId = null;
-    let tapstitchOrderId = null;
-
-    // ── PRINTIFY ──────────────────────────────────────────
-    if (printifyItems.length && shippingAddress) {
-      const pr = await fetch(`${PRINTIFY_BASE}/shops/${SHOP_ID}/orders.json`, {
-        method: 'POST',
-        headers: pHeaders(),
-        body: JSON.stringify({
-          external_id: `2am-${paymentIntentId}`,
-          label: '2AM Order',
-          line_items: printifyItems.map(i => ({
-            product_id: i.id,
-            variant_id: i.variantId,
-            quantity: 1,
-          })),
-          shipping_method: 1,
-          send_shipping_notification: true,
-          address_to: {
-            first_name: shippingAddress.firstName,
-            last_name: shippingAddress.lastName,
-            email: email || '',
-            phone: shippingAddress.phone || '',
-            country: shippingAddress.country || 'US',
-            region: shippingAddress.state,
-            address1: shippingAddress.line1,
-            address2: shippingAddress.line2 || '',
-            city: shippingAddress.city,
-            zip: shippingAddress.zip,
-          },
-        }),
-      });
-      if (pr.ok) {
-        const po = await pr.json();
-        printifyOrderId = po.id;
-        console.log('✅ Printify order:', printifyOrderId);
-      } else {
-        console.error('⚠️ Printify failed:', await pr.text());
+    function passesNoteFilter(pieces) {
+      if (!notes) return true;
+      const text = pieces.map(p => `${getName(p)} ${getColor(p)}`).join(' ').toLowerCase();
+      const noMatch = notes.match(/no\s+(\w+)/g);
+      if (noMatch) for (const m of noMatch) { if (text.includes(m.replace('no ', ''))) return false; }
+      if (notes.includes('all black') || notes.includes('dark')) {
+        if (['white','cream','beige','yellow','pink','light'].some(c => text.includes(c))) return false;
       }
+      return true;
     }
 
-    // ── TAPSTITCH ─────────────────────────────────────────
-    if (tapstitchItems.length) {
-      tapstitchOrderId = `ts-${paymentIntentId}`;
-      console.log('🧵 TapStitch order:', {
-        orderId: tapstitchOrderId,
-        customer: { email, ...shippingAddress },
-        items: tapstitchItems.map(i => ({ name: i.name, size: i.size, color: i.color, notes: i.notes, price: i.price })),
-      });
+    let best = null, bestScore = -1;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const top    = shuffle(byRole.top)[0];
+      const bottom = shuffle(byRole.bottom)[0];
+      const shoes  = shuffle(byRole.shoes)[0];
+      const layer  = byRole.layer.length && Math.random() > 0.75 ? shuffle(byRole.layer)[0] : null;
+      const pieces = [top, bottom, shoes, layer].filter(Boolean);
+      if (isBanned(pieces) || !passesNoteFilter(pieces)) continue;
+      const score = harmonyScore(pieces);
+      if (score > bestScore) { bestScore = score; best = pieces; if (score >= 88) break; }
+    }
+    if (!best) {
+      const top = shuffle(byRole.top)[0], bottom = shuffle(byRole.bottom)[0], shoes = shuffle(byRole.shoes)[0];
+      best = [top, bottom, shoes]; bestScore = harmonyScore(best);
     }
 
-    // ── GENERATE WARDROBE ACTIVATION CODES ───────────────
-    // One code per item purchased — customer enters each in WARDROBE
-    const wardrobeCodes = items.map(item => {
-      const code = generateWardrobeCode();
+    const pieceNames    = best.map(getName);
+    const confidence    = Math.min(bestScore / 100, 1.0);
+    const closetSummary = best.map(p => `${getName(p)} (${getColor(p)}, ${getType(p)})`).join(', ');
 
-      // Determine clothing type from product name
-      const nameLower = (item.name || '').toLowerCase();
-      let clothingType = 'top';
-      if (nameLower.includes('hoodie') || nameLower.includes('sweatshirt')) clothingType = 'hoodie';
-      else if (nameLower.includes('tee') || nameLower.includes('t-shirt') || nameLower.includes('shirt')) clothingType = 'tee';
-      else if (nameLower.includes('case') || nameLower.includes('phone')) clothingType = 'accessory';
-      else if (nameLower.includes('pants') || nameLower.includes('jogger')) clothingType = 'bottom';
-      else if (nameLower.includes('jacket') || nameLower.includes('coat')) clothingType = 'outerwear';
+    const description = await ask(
+      `You are a fashion stylist. Given a specific outfit, write a creative name, vibe, why it works, and one wearing tip. Be specific and confident. Return ONLY valid JSON.`,
+      `Occasion: ${occasion}. Weather: ${weather}.${notes ? ` User note: "${notes}".` : ''}
+Outfit: ${closetSummary}
 
-      let collection = 'General';
-      if (nameLower.includes('iceman')) collection = 'Iceman';
+JSON:
+{"name":"<2-4 word creative name>","vibe":"<one sentence mood>","why_it_works":"<color/silhouette logic>","stylist_tip":"<one actionable tip>"}`,
+      true, 250, FAST
+    );
+    let desc = { name: 'CLEAN BUILD', vibe: '', why_it_works: '', stylist_tip: '' };
+    try { desc = JSON.parse(description); } catch (_) {}
 
-      // Store the code record
-      WARDROBE_CODES[code] = {
-        productId: item.id,
-        productName: item.name,
-        productImg: item.img,
-        productImages: item.images || [],
-        productColors: item.colors || [],
-        clothingType,
-        collection,
-        price: item.price,
-        size: item.size,
-        color: item.color,
-        orderId: printifyOrderId || tapstitchOrderId,
-        email,
-        createdAt: new Date().toISOString(),
-        claimed: false,
-        claimedAt: null,
-        claimedBy: null,
-      };
-
-      console.log(`🎟️ WARDROBE code generated: ${code} for "${item.name}"`);
-
-      return {
-        code,
-        productName: item.name,
-        productImg: item.img,
-      };
-    });
-
-    res.json({
-      success: true,
-      paymentIntentId,
-      printifyOrderId,
-      tapstitchOrderId,
-      // ← these codes go in the order confirmation email / page
-      wardrobeCodes,
-      wardrobeMessage: wardrobeCodes.length > 0
-        ? `You have ${wardrobeCodes.length} WARDROBE activation code${wardrobeCodes.length > 1 ? 's' : ''}. Open WARDROBE → Add Clothes → Enter Code to track your 2AM items.`
-        : null,
-    });
-  } catch (err) {
-    console.error('Payment error:', err);
-    res.status(500).json({ error: err.message });
+    log('/api/outfits', 200, Date.now()-t0, `score=${bestScore} pieces=${best.length}`);
+    res.json({ outfit: { name: desc.name || 'CLEAN BUILD', pieces: pieceNames, vibe: desc.vibe || '', why_it_works: desc.why_it_works || '', stylist_tip: desc.stylist_tip || '', confidence }, source: 'smart_randomizer' });
+  } catch (e) {
+    log('/api/outfits', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Outfit generation failed.' });
   }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// DROP SIGNUP
+// GRIND BROWSER — Accounts, Profiles, AI Coach
 // ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/drop-signup', (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'No email' });
-  console.log('📧 Drop signup:', email);
-  res.json({ success: true });
+
+const GRIND_USERS    = {};
+const GRIND_PROFILES = {};
+
+function grindAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'No token provided.' });
+  try { req.grindUser = jwt.verify(auth.split(' ')[1], JWT_SECRET); next(); }
+  catch (e) { res.status(401).json({ error: 'Invalid or expired token.' }); }
+}
+
+app.post('/grind/account/create', grindLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const email    = strShort(req.body.email,    '').toLowerCase();
+    const password = strShort(req.body.password, '');
+    const name     = strShort(req.body.name,     '');
+    const username = strShort(req.body.username, '').toLowerCase().replace(/[^a-z0-9_]/g, '');
+    if (!email || !email.includes('@')) return res.status(400).json({ error: 'Valid email required.' });
+    if (!password || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+    if (GRIND_USERS[email]) return res.status(409).json({ error: 'An account with this email already exists.' });
+    const hash  = await bcrypt.hash(password, 10);
+    GRIND_USERS[email] = { hash, name, username, createdAt: Date.now() };
+    const token = jwt.sign({ email, name, username }, JWT_SECRET, { expiresIn: '365d' });
+    log('/grind/account/create', 200, Date.now()-t0, `user=${email}`);
+    res.json({ token, user: { email, name, username } });
+  } catch (e) {
+    log('/grind/account/create', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Account creation failed.' });
+  }
 });
 
-app.listen(PORT, () => console.log(`2AM backend on port ${PORT}`));
+app.post('/grind/account/login', grindLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const email    = strShort(req.body.email,    '').toLowerCase();
+    const password = strShort(req.body.password, '');
+    const user = GRIND_USERS[email];
+    if (!user) return res.status(404).json({ error: 'No account found with this email.' });
+    const ok = await bcrypt.compare(password, user.hash);
+    if (!ok) return res.status(401).json({ error: 'Incorrect password.' });
+    const token = jwt.sign({ email, name: user.name, username: user.username }, JWT_SECRET, { expiresIn: '365d' });
+    log('/grind/account/login', 200, Date.now()-t0, `user=${email}`);
+    res.json({ token, user: { email, name: user.name, username: user.username } });
+  } catch (e) {
+    log('/grind/account/login', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Login failed.' });
+  }
+});
+
+app.post('/grind/profile/sync', grindAuth, grindLimiter, (req, res) => {
+  const t0 = Date.now();
+  try {
+    const { email } = req.grindUser;
+    const profile   = req.body.profile   || {};
+    const bookmarks = Array.isArray(req.body.bookmarks) ? req.body.bookmarks.slice(0, 200) : [];
+    const history   = Array.isArray(req.body.history)   ? req.body.history.slice(0, 100)   : [];
+    const { token: _tok, ...safeProfile } = profile;
+    GRIND_PROFILES[email] = { profile: safeProfile, bookmarks, history, updatedAt: Date.now() };
+    log('/grind/profile/sync', 200, Date.now()-t0, `user=${email}`);
+    res.json({ ok: true, synced: Date.now() });
+  } catch (e) {
+    log('/grind/profile/sync', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Sync failed.' });
+  }
+});
+
+app.get('/grind/profile/load', grindAuth, grindLimiter, (req, res) => {
+  const t0 = Date.now();
+  try {
+    const { email } = req.grindUser;
+    const data = GRIND_PROFILES[email];
+    if (!data) return res.json({ profile: null, bookmarks: [], history: [] });
+    log('/grind/profile/load', 200, Date.now()-t0, `user=${email}`);
+    res.json(data);
+  } catch (e) {
+    log('/grind/profile/load', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Load failed.' });
+  }
+});
+
+app.post('/grind/coach', aiLimiter, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const message = strShort(req.body.message, '');
+    const context = strShort(req.body.context, '');
+    if (!message) return res.status(400).json({ error: 'Message is required.' });
+    const reply = await ask(
+      `You are a sharp, direct AI productivity coach built into GRIND Browser — a browser for builders, students, and young founders. ${context ? `User context: ${context}` : ''}
+Rules: Max 2 sentences. No fluff. Be real, not motivational-poster. Give actionable advice. If they're off task, call it out.`,
+      message, false, 120, FAST
+    );
+    log('/grind/coach', 200, Date.now()-t0);
+    res.json({ reply });
+  } catch (e) {
+    log('/grind/coach', 500, Date.now()-t0, e.message);
+    res.status(500).json({ error: 'Coach unavailable.' });
+  }
+});
+
+// ─── 404 & error handlers ─────────────────────────────────────────────────────
+app.use((req, res) => res.status(404).json({ error: 'Route not found.' }));
+app.use((err, req, res, next) => {
+  console.error(`[${new Date().toISOString()}] Unhandled error:`, err.message);
+  res.status(500).json({ error: 'Something went wrong.' });
+});
+
+app.listen(PORT, () => {
+  console.log(`[${new Date().toISOString()}] Night.inc backend → port ${PORT}`);
+  console.log(`Auth: ${APP_SECRET ? 'ENABLED' : 'DISABLED'}`);
+});
