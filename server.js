@@ -1,478 +1,976 @@
-require('dotenv').config();
+// ============================================================
+//  NIGHT.INC UNIFIED BACKEND — server.js
+//  Serves: APEX · WARDROBE · INDEX · NEXUS · KINETIC · AURA · 2AM
+//  Deploy on Railway. Set env vars:
+//    OPENAI_API_KEY, PRINTIFY_API_KEY, PRINTIFY_SHOP_ID,
+//    STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, APEX_APP_SECRET
+// ============================================================
+
 const express    = require('express');
 const cors       = require('cors');
+const bodyParser = require('body-parser');
 const OpenAI     = require('openai');
-const rateLimit  = require('express-rate-limit');
-const helmet     = require('helmet');
-const bcrypt     = require('bcryptjs');
-const jwt        = require('jsonwebtoken');
+const Stripe     = require('stripe');
+const crypto     = require('crypto');
+const fs         = require('fs');
+const path       = require('path');
 
-const app  = express();
-const PORT = process.env.PORT || 3000;
+const app    = express();
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 90000 });
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
-app.use(helmet());
-app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
-app.use(express.json({ limit: '50kb' }));
-app.use(express.urlencoded({ extended: true, limit: '50kb' }));
+app.use(cors());
+// Raw body needed for Stripe webhooks — must come before json parser
+app.use('/webhook/stripe', express.raw({ type: 'application/json' }));
+app.use(bodyParser.json({ limit: '10mb' }));
 
-if (!process.env.OPENAI_API_KEY) {
-  console.error('FATAL: OPENAI_API_KEY not set');
-  process.exit(1);
+// ─────────────────────────────────────────────────────────────
+//  2AM PRODUCT CATALOG
+//  Single source of truth used by: store, WARDROBE scanner,
+//  outfit engine, order confirmation sync
+// ─────────────────────────────────────────────────────────────
+const TWO_AM_CATALOG = [
+  {
+    id: 'iceman-tee-blk',
+    name: 'ICEMAN Tee',
+    collection: 'ICEMAN',
+    type: 'tee',
+    price: 3800,
+    colors: ['#0a0a0a','#1a1a1a'],
+    colorNames: ['Black','Washed Black'],
+    patterns: ['graphic-front','minimal-back','chest-logo'],
+    printifyId: null,
+    inStock: true,
+    images: ['https://2amcases.com/assets/iceman-tee-blk.jpg'],
+    tags: ['showfloor','tshirt'],
+    description: 'ICEMAN graphic tee. Heavyweight 300gsm. Dropped shoulders.',
+  },
+  {
+    id: 'og-hoodie-blk',
+    name: '2AM OG Hoodie',
+    collection: 'CORE',
+    type: 'hoodie',
+    price: 6800,
+    colors: ['#0a0a0a'],
+    colorNames: ['Black'],
+    patterns: ['embroidered-chest','clean-back','ribbed-cuffs'],
+    printifyId: null,
+    inStock: true,
+    images: ['https://2amcases.com/assets/og-hoodie-blk.jpg'],
+    tags: ['showfloor','hoodie'],
+    description: 'The original. 400gsm fleece. 2AM chest embroidery.',
+  },
+  {
+    id: 'night-joggers-blk',
+    name: 'Night Joggers',
+    collection: 'CORE',
+    type: 'bottoms',
+    price: 5200,
+    colors: ['#0a0a0a','#2a2a2a'],
+    colorNames: ['Black','Charcoal'],
+    patterns: ['side-tape','ankle-rib','minimal-logo'],
+    printifyId: null,
+    inStock: true,
+    images: ['https://2amcases.com/assets/night-joggers-blk.jpg'],
+    tags: ['showfloor','pants'],
+    description: 'Technical jogger. Tapered fit. Side tape detail.',
+  },
+  {
+    id: 'cargo-shorts-blk',
+    name: '2AM Cargo Shorts',
+    collection: 'SUMMER',
+    type: 'bottoms',
+    price: 4400,
+    colors: ['#0a0a0a'],
+    colorNames: ['Black'],
+    patterns: ['cargo-pockets','logo-tab','clean-hem'],
+    printifyId: null,
+    inStock: true,
+    images: ['https://2amcases.com/assets/cargo-shorts-blk.jpg'],
+    tags: ['showfloor','shorts'],
+    description: '6-pocket cargo. Utility meets clean aesthetic.',
+  },
+  {
+    id: 'night-cap-blk',
+    name: 'Night Cap 6-Panel',
+    collection: 'CORE',
+    type: 'headwear',
+    price: 2800,
+    colors: ['#0a0a0a','#c8a96e'],
+    colorNames: ['Black','Black/Tan'],
+    patterns: ['embroidered-front','clean-back','unstructured'],
+    printifyId: null,
+    inStock: true,
+    images: ['https://2amcases.com/assets/night-cap-blk.jpg'],
+    tags: ['showfloor','hat'],
+    description: 'Unstructured 6-panel. 2AM embroidered front.',
+  },
+  {
+    id: 'iceman-vol2-tee-blk',
+    name: 'ICEMAN Vol.2 Tee',
+    collection: 'ICEMAN',
+    type: 'tee',
+    price: 3800,
+    colors: ['#0a0a0a','#111111','#1a1a2e','#0d1117'],
+    colorNames: ['Black','Off Black','Midnight Navy','Void'],
+    patterns: ['oversized-graphic','ice-print','back-text','sleeve-hit'],
+    printifyId: null,
+    inStock: true,
+    images: ['https://2amcases.com/assets/iceman-v2-blk.jpg'],
+    tags: ['showfloor','tshirt','new'],
+    description: 'Vol.2. Bigger graphic. Same energy.',
+  },
+];
+
+// Visual fingerprints for scanner recognition (80% match threshold)
+const TWO_AM_VISUAL_FINGERPRINTS = {
+  colorPalette: [
+    { hex: '#0a0a0a', name: 'Void Black',    weight: 0.40 },
+    { hex: '#111111', name: 'Deep Black',    weight: 0.25 },
+    { hex: '#1a1a1a', name: 'Washed Black',  weight: 0.15 },
+    { hex: '#2a2a2a', name: 'Charcoal',      weight: 0.10 },
+    { hex: '#c8a96e', name: 'Gold Accent',   weight: 0.05 },
+    { hex: '#ffffff', name: 'White Hit',     weight: 0.05 },
+  ],
+  designMotifs: [
+    'large-chest-graphic', 'minimal-wordmark', 'dropped-shoulder',
+    'oversized-fit', 'embroidered-logo', 'side-tape', 'ribbed-hem',
+    'ice-graphic', 'night-themed-print', 'monochrome-palette',
+  ],
+  neverMatch: [
+    'supreme', 'nike', 'adidas', 'off-white', 'palace', 'stussy',
+    'fear-of-god', 'essentials', 'champion', 'carhartt', 'stone-island',
+  ],
+};
+
+// ─────────────────────────────────────────────────────────────
+//  WARDROBE CODE STORE  (file-persisted — survives Railway restarts)
+//  Upgrade path: swap readCodesFile/writeCodesFile for Redis/Supabase
+// ─────────────────────────────────────────────────────────────
+const CODES_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'wardrobe_codes.json');
+
+function readCodesFile() {
+  try {
+    return JSON.parse(fs.readFileSync(CODES_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
 }
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 45000, maxRetries: 2 });
 
-const APP_SECRET = process.env.APP_SECRET || null;
-const JWT_SECRET = process.env.JWT_SECRET || 'grind_night_inc_2026';
-
-function requireAuth(req, res, next) {
-  if (!APP_SECRET) return next();
-  const secret = req.headers['x-app-secret'];
-  if (!secret || secret !== APP_SECRET) return res.status(401).json({ error: 'Unauthorized.' });
-  next();
+function writeCodesFile(data) {
+  try {
+    fs.writeFileSync(CODES_FILE, JSON.stringify(data), 'utf8');
+  } catch (e) {
+    console.error('[wardrobe-persist] write error:', e.message);
+  }
 }
 
-const globalLimiter = rateLimit({ windowMs: 15*60*1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests.' } });
-const aiLimiter     = rateLimit({ windowMs: 15*60*1000, max: 30,  standardHeaders: true, legacyHeaders: false, message: { error: 'AI limit reached. Try again soon.' } });
-const grindLimiter  = rateLimit({ windowMs: 15*60*1000, max: 60,  standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests.' } });
-app.use(globalLimiter);
+// Warm in-memory Map from disk on startup
+const _codesRaw = readCodesFile();
+const wardrobeCodes = new Map(Object.entries(_codesRaw));
+console.log(`[wardrobe-persist] Loaded ${wardrobeCodes.size} code(s) from disk.`);
 
-const FAST  = 'gpt-4.1-mini';
-const SMART = 'gpt-4.1-mini';
+function wardrobeSet(code, entry) {
+  wardrobeCodes.set(code, entry);
+  // Write entire map to disk after every mutation — small dataset, safe
+  writeCodesFile(Object.fromEntries(wardrobeCodes));
+}
 
-async function ask(system, user, json = false, maxTokens = 800, model = FAST) {
-  const res = await openai.chat.completions.create({
-    model, max_tokens: maxTokens,
-    response_format: json ? { type: 'json_object' } : undefined,
-    messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+function generateWardrobeCode() {
+  const seg1 = crypto.randomBytes(2).toString('hex').toUpperCase();
+  const seg2 = Math.floor(Math.random() * 900 + 100).toString();
+  return `WARDROBE-${seg1}-${seg2}`;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  HEALTH CHECK
+// ─────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    service: 'Night.inc Unified Backend',
+    version: '3.0.0',
+    apps: ['APEX','WARDROBE','INDEX','NEXUS','KINETIC','AURA','2AM'],
+    routes: {
+      apex:    ['/schedule','POST /api/apex/streak/log','GET /api/apex/streak/:userId'],
+      wardrobe:['/api/outfits','POST /api/wardrobe/scan','/api/wardrobe/validate-code','GET /api/wardrobe/catalog'],
+      index:   ['/ai/curriculum/build','/ai/curriculum/expand','/ai/curriculum/chat'],
+      nexus:   ['/api/nexus/idea'],
+      kinetic: ['/api/kinetic/meal'],
+      aura:    ['/api/aura/analyze'],
+      store:   ['GET /api/store/products','POST /api/store/checkout','GET /api/store/order','POST /webhook/stripe'],
+    },
+    timestamp: new Date().toISOString(),
   });
-  return res.choices[0].message.content;
-}
-
-function str(val, fallback = '')      { return typeof val !== 'string' ? fallback : val.trim().slice(0, 2000); }
-function strShort(val, fallback = '') { return typeof val !== 'string' ? fallback : val.trim().slice(0, 200); }
-function safeArray(val, limit = 20)   { return !Array.isArray(val) ? [] : val.slice(0, limit).map(i => String(i).trim().slice(0, 200)); }
-function log(route, status, ms, extra = '') { console.log(`[${new Date().toISOString()}] ${route} ${status} ${ms}ms ${extra}`); }
-
-// ─── Health ───────────────────────────────────────────────────────────────────
-app.get('/', (_, res) => res.json({
-  status: 'NIGHT_INC_ONLINE', version: '3.2.0',
-  apps: ['APX','INDEX','NEXUS','KINETIC','AURA','DECK','WARDROBE','GRIND'],
-}));
-
-// ══════════════════════════════════════════════════════════════════════════════
-// APX — POST /schedule
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/schedule', requireAuth, aiLimiter, async (req, res) => {
-  const t0 = Date.now();
-  try {
-    const username    = strShort(req.body.username,    'OPERATOR');
-    const tasks       = safeArray(req.body.tasks, 12);
-    const wakeTime    = strShort(req.body.wakeTime,    '6:30 AM');
-    const sleepTime   = strShort(req.body.sleepTime,   '10:30 PM');
-    const notes       = strShort(req.body.notes,       '');
-    const date        = strShort(req.body.date,        '');
-    const currentTime = strShort(req.body.currentTime, '');
-    const currentDay  = strShort(req.body.currentDay,  '');
-    const profileAge          = strShort(req.body.profileAge,          '');
-    const profileSchool       = strShort(req.body.profileSchool,       '');
-    const profileSports       = strShort(req.body.profileSports,       '');
-    const profilePracticeDays = strShort(req.body.profilePracticeDays, '');
-    const profilePracticeTime = strShort(req.body.profilePracticeTime, '');
-    const profileBusiness     = strShort(req.body.profileBusiness,     '');
-    const profileGoals        = strShort(req.body.profileGoals,        '');
-    const profileOther        = strShort(req.body.profileOther,        '');
-    const profileSchedule     = str(req.body.profileSchedule, '');
-    const profileContext      = str(req.body.profileContext,   '');
-
-    const taskList = tasks.length ? tasks.map((t,i) => `${i+1}. ${t}`).join('\n') : 'General high-performance day.';
-    const constraints = [];
-    if (profileSchedule) constraints.push(`FIXED SCHEDULE (use exact times for ${currentDay}):\n${profileSchedule}`);
-    else if (profileContext) constraints.push(`PROFILE & SCHEDULE:\n${profileContext}`);
-    if (profilePracticeDays && profilePracticeTime) constraints.push(`PRACTICE: ${profilePracticeDays} at ${profilePracticeTime} — NON-NEGOTIABLE`);
-    const fixedBlock = constraints.length ? `⚠️ FIXED CONSTRAINTS — respect exactly:\n${constraints.join('\n\n')}\n` : '';
-    const personalLines = [
-      profileAge && `Age: ${profileAge}`, profileSchool && `School: ${profileSchool}`,
-      profileSports && `Sports: ${profileSports}`, profileBusiness && `Business: ${profileBusiness}`,
-      profileGoals && `Goals: ${profileGoals}`, profileOther && `Other: ${profileOther}`,
-    ].filter(Boolean).join(' | ');
-
-    const out = await ask(
-      `You are APEX AI — an elite daily scheduler for high-performance people of any age, background, or lifestyle.
-
-Your job: read the user's profile, fixed schedule, and tasks — then build the best possible day around their real life.
-
-HOW TO READ THE CONTEXT:
-• If a fixed schedule is provided — treat those times as NON-NEGOTIABLE. Build everything else around them.
-• If sports or training is listed — include a workout block with specifics matching their sport/fitness level.
-• If a business or project is listed — include focused work blocks for it.
-• If a sleep time is set — that is the hard stop. Nothing after it.
-• Respect the user's actual life. A student has school. An athlete has practice. A founder has brand work.
-
-RULES:
-1. Fixed commitments are sacred — never schedule over them
-2. Fill EVERY hour from wake to sleep — zero gaps, zero truncation
-3. Activities must be SPECIFIC — exact exercises/sets/reps, exact tasks, exact actions. Never vague.
-4. Minimum 8 blocks, as many as needed to cover the full day
-5. Return ONLY valid JSON — complete every block, never stop early
-
-CATEGORIES: ops, fitness, study, biz, church, rest`,
-      `OPERATOR: ${username}
-DATE: ${date} ${currentDay} | NOW: ${currentTime}
-WAKE: ${wakeTime} → SLEEP: ${sleepTime}
-${personalLines ? `ABOUT: ${personalLines}` : ''}
-
-${fixedBlock}
-NOTES: ${notes || 'none'}
-
-TASKS TO FIT IN TODAY:
-${taskList}
-
-JSON (cover every hour ${wakeTime}→${sleepTime}, min 8 blocks):
-{"success":true,"data":{"summary":"<one punchy sentence>","totalXP":<sum>,"blocks":[{"time":"<h:mm AM/PM>","duration":"<X min>","activity":"<SPECIFIC>","category":"<ops|fitness|study|biz|church|rest>","xp":<50-300>}]}}`,
-      true, 2500, SMART
-    );
-    let parsed;
-    try { parsed = JSON.parse(out); } catch { return res.status(502).json({ success: false, data: null, error: 'AI returned invalid response.' }); }
-    log('/schedule', 200, Date.now()-t0, `blocks=${parsed?.data?.blocks?.length ?? 0}`);
-    res.json(parsed);
-  } catch (e) {
-    log('/schedule', 500, Date.now()-t0, e.message);
-    res.status(500).json({ success: false, data: null, error: 'Schedule generation failed.' });
-  }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// APX — Finance
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/apx/finance/split', requireAuth, (req, res) => {
-  const amt = parseFloat(req.body.income);
-  if (isNaN(amt) || amt < 0 || amt > 1_000_000) return res.status(400).json({ error: 'Invalid income value.' });
-  res.json({ total: amt, split: { reinvestment: +(amt*0.80).toFixed(2), investing: +(amt*0.08).toFixed(2), savings: +(amt*0.07).toFixed(2), tools: +(amt*0.03).toFixed(2), personal: +(amt*0.02).toFixed(2) } });
-});
-
-app.post('/apx/finance/advice', requireAuth, aiLimiter, async (req, res) => {
-  const t0 = Date.now();
+// ─────────────────────────────────────────────────────────────
+//  SHARED AI ENGINE  (used by ALL apps)
+//  POST /api/chat  { system, messages, app }
+// ─────────────────────────────────────────────────────────────
+app.post('/api/chat', async (req, res) => {
   try {
-    const message = strShort(req.body.message, '');
-    const entries = safeArray(req.body.entries, 10).map(e => (typeof e === 'object' ? `${e.type}: $${e.amount} (${e.label})` : String(e)));
-    if (!message) return res.status(400).json({ error: 'Message is required.' });
-    const reply = await ask('APX finance advisor for a teen entrepreneur. Direct, specific, real numbers. Max 120 words.', `Log:\n${entries.join('\n') || 'none'}\nQuestion: ${message}`, false, 400, FAST);
-    log('/apx/finance/advice', 200, Date.now()-t0);
-    res.json({ advice: reply });
-  } catch (e) {
-    log('/apx/finance/advice', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Finance advice unavailable.' });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// INDEX — Curriculum
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/ai/curriculum/build', requireAuth, aiLimiter, async (req, res) => {
-  const t0 = Date.now();
-  try {
-    const topic = strShort(req.body.topic, 'Programming');
-    const depth = strShort(req.body.depth, 'beginner');
-    const style = strShort(req.body.style, 'practical');
-    const count = Math.min(Math.max(parseInt(req.body.lesson_count) || 5, 1), 10);
-    if (!topic) return res.status(400).json({ error: 'Topic is required.' });
-    const safeDepth = ['beginner','intermediate','advanced'].includes(depth) ? depth : 'beginner';
-    const safeStyle = ['practical','theoretical','project'].includes(style) ? style : 'practical';
-    const styleGuide = safeStyle==='practical' ? 'Lead with real working code/examples. Explain every step.' : safeStyle==='theoretical' ? 'Build intuition first with sharp analogies. Then formalize.' : 'Every lesson = one concrete step toward a finished project.';
-    const depthGuide = safeDepth==='beginner' ? 'Zero prior knowledge assumed. Plain language.' : safeDepth==='intermediate' ? 'Basics assumed. Go deep on mechanics and edge cases.' : 'Strong foundation assumed. Advanced patterns and production thinking.';
-    const out = await ask(
-      `You are INDEX — an elite curriculum builder. ${styleGuide} ${depthGuide}
-Write like a brilliant mentor to a sharp 16-year-old who learns fast.
-Each lesson needs one clear aha moment. Use real examples, real code, real analogies.
-Return ONLY valid JSON — no markdown fences, completely parseable. Complete all lessons fully.`,
-      `Build a ${count}-lesson curriculum on: "${topic}"
-
-JSON:
-{"curriculum":{"id":"curriculum-1","topic":"${topic}","tagline":"<what student will DO — specific>","total_xp":<sum>,"earned_xp":0,"lessons":[{"id":"lesson-1","title":"<compelling title>","emoji":"<emoji>","summary":"<one sentence hinting at aha moment>","content":"<rich markdown 200-350 words: headers, bullets, code blocks>","key_points":["<real insight>","<real insight>","<real insight>"],"xp":<100-200>,"completed":false,"quiz_passed":false,"quiz":[{"id":"q-1-1","question":"<tests real understanding>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},{"id":"q-1-2","question":"<different concept>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null},{"id":"q-1-3","question":"<practical application>","options":["<A>","<B>","<C>","<D>"],"correct_index":<0-3>,"user_answer":null}]}]}}
-
-RULES: exactly ${count} lessons, exactly 3 quiz questions each, total_xp = sum of xp. Do NOT truncate.`,
-      true, 6000, SMART
-    );
-    let parsed;
-    try { parsed = JSON.parse(out); } catch { return res.status(502).json({ error: 'AI returned invalid curriculum.' }); }
-    log('/ai/curriculum/build', 200, Date.now()-t0, `lessons=${parsed?.curriculum?.lessons?.length ?? 0}`);
-    res.json(parsed);
-  } catch (e) {
-    log('/ai/curriculum/build', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Curriculum build failed.' });
-  }
-});
-
-app.post('/ai/curriculum/chat', requireAuth, aiLimiter, async (req, res) => {
-  const t0 = Date.now();
-  try {
-    const message        = strShort(req.body.message, '');
-    const lesson_context = str(req.body.lesson_context, '').slice(0, 600);
-    const topic          = strShort(req.body.topic, '');
-    if (!message) return res.status(400).json({ error: 'Message is required.' });
-    const reply = await ask(`You are INDEX AI — a sharp, direct tutor for "${topic}".\nLesson context: ${lesson_context}\nBe clear and specific. Max 150 words. Never cut off mid-sentence.`, message, false, 600, FAST);
-    log('/ai/curriculum/chat', 200, Date.now()-t0);
-    res.json({ reply });
-  } catch (e) {
-    log('/ai/curriculum/chat', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Tutor unavailable.' });
-  }
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-// NEXUS + KINETIC + AURA + DECK — POST /api/chat
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/chat', requireAuth, aiLimiter, async (req, res) => {
-  const t0 = Date.now();
-  try {
-    const system   = str(req.body.system, '').slice(0, 800);
-    const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
-    if (!messages.length) return res.status(400).json({ error: 'Messages array is required.' });
-    const history = messages.slice(-6)
-      .filter(m => m && typeof m.role === 'string' && typeof m.content === 'string')
-      .map(m => ({ role: ['user','assistant','system'].includes(m.role) ? m.role : 'user', content: String(m.content).slice(0, 1000) }));
-    if (!history.length) return res.status(400).json({ error: 'No valid messages provided.' });
+    const { system, messages, app: appName = 'unknown' } = req.body;
     const completion = await openai.chat.completions.create({
-      model: FAST, max_tokens: 800,
-      messages: [{ role: 'system', content: system + '\n\nAlways complete your full response. Never cut off mid-sentence.' }, ...history],
+      model: 'gpt-4o',
+      max_tokens: 1000,
+      messages: [
+        { role: 'system', content: system || 'You are a helpful assistant for Night.inc.' },
+        ...(messages || []),
+      ],
     });
-    log('/api/chat', 200, Date.now()-t0);
     res.json({ reply: completion.choices[0].message.content });
-  } catch (e) {
-    log('/api/chat', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'AI unavailable.' });
+  } catch (err) {
+    console.error('[/api/chat]', err.message);
+    res.status(500).json({ reply: 'AI offline. Try again shortly.' });
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// WARDROBE — POST /api/outfits
-// Smart randomizer — picks pieces by role + color harmony, AI writes description only
-// ══════════════════════════════════════════════════════════════════════════════
-app.post('/api/outfits', requireAuth, aiLimiter, async (req, res) => {
-  const t0 = Date.now();
+// ─────────────────────────────────────────────────────────────
+//  APEX — schedule generator
+//  POST /schedule  { name, wakeTime, goals, habits, ... }
+// ─────────────────────────────────────────────────────────────
+app.post('/schedule', async (req, res) => {
   try {
-    const items          = Array.isArray(req.body.items) ? req.body.items.slice(0, 100) : [];
-    const occasion       = strShort(req.body.occasion, 'casual');
-    const weather        = strShort(req.body.weather,  'mild');
-    const notes          = strShort(req.body.notes,    '').toLowerCase();
-    const previousCombos = Array.isArray(req.body.previousCombos) ? req.body.previousCombos.slice(0, 50) : [];
-
-    if (items.length < 2) return res.status(400).json({ error: 'Add at least 2 items to your closet.' });
-
-    const byRole = { top: [], bottom: [], shoes: [], layer: [] };
-    const TOP_TYPES    = ['tee','hoodie','shirt','top','crewneck','longsleeve','tank','jersey','sweater','sweatshirt'];
-    const BOTTOM_TYPES = ['pants','jeans','shorts','sweats','cargo','trousers','joggers','skirt','chinos','denim'];
-    const SHOE_TYPES   = ['footwear','shoes','sneakers','boots','slides','sandals','jordan','nike','adidas','air force','dunks','yeezy','loafer','runner'];
-    const LAYER_TYPES  = ['jacket','coat','zip','vest','blazer','windbreaker','puffer','fleece'];
-
-    function getName(it)  { return typeof it === 'object' ? (it.name  || 'item') : String(it); }
-    function getColor(it) { return typeof it === 'object' ? (it.color || 'grey') : 'grey'; }
-    function getType(it)  { return typeof it === 'object' ? (it.type  || '')     : ''; }
-
-    for (const it of items) {
-      const type     = getType(it).toLowerCase();
-      const name     = getName(it).toLowerCase();
-      const combined = `${type} ${name}`;
-      if      (SHOE_TYPES  .some(k => combined.includes(k))) byRole.shoes .push(it);
-      else if (BOTTOM_TYPES.some(k => combined.includes(k))) byRole.bottom.push(it);
-      else if (LAYER_TYPES .some(k => combined.includes(k))) byRole.layer .push(it);
-      else                                                    byRole.top   .push(it);
-    }
-
-    if (!byRole.top.length)    return res.status(400).json({ error: 'No tops found. Add a tee, hoodie, or shirt.' });
-    if (!byRole.bottom.length) return res.status(400).json({ error: 'No bottoms found. Add pants or jeans.' });
-    if (!byRole.shoes.length)  return res.status(400).json({ error: 'No shoes found. Add sneakers or boots.' });
-
-    const coreCount    = byRole.top.length + byRole.bottom.length + byRole.shoes.length;
-    const banThreshold = coreCount <= 6 ? 1 : 2;
-    const bannedSets   = previousCombos.map(c => new Set((Array.isArray(c) ? c : [c]).map(n => n.toLowerCase().trim())));
-
-    function isBanned(pieces) {
-      const nameSet = new Set(pieces.map(p => getName(p).toLowerCase().trim()));
-      return bannedSets.some(banned => { let o = 0; for (const n of banned) { if (nameSet.has(n)) o++; } return o >= banThreshold; });
-    }
-    function shuffle(arr) {
-      const a = [...arr];
-      for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
-      return a;
-    }
-    function hexToRgb(color) {
-      const nameMap = { black:'#111111',white:'#f5f5f0',grey:'#888888',gray:'#888888',navy:'#1b2a4a',blue:'#2563eb',red:'#dc2626',green:'#16a34a',brown:'#92400e',beige:'#d4c5a9',cream:'#fef3c7',orange:'#ea580c',purple:'#7c3aed',pink:'#f472b6',yellow:'#eab308',olive:'#4d7c0f',tan:'#d97706',camel:'#b45309',rust:'#b45309',burgundy:'#7f1d1d',charcoal:'#374151',slate:'#64748b',khaki:'#bdb76b',stone:'#a8a29e' };
-      let hex = color.toLowerCase().startsWith('#') ? color : (nameMap[color.toLowerCase()] || '#888888');
-      hex = hex.replace('#', ''); if (hex.length === 3) hex = hex.split('').map(c => c+c).join('');
-      const n = parseInt(hex, 16); return { r: (n>>16)&255, g: (n>>8)&255, b: n&255 };
-    }
-    function harmonyScore(pieces) {
-      if (pieces.length < 2) return 70;
-      const rgbs = pieces.map(p => hexToRgb(getColor(p))); let total = 0, pairs = 0;
-      for (let i = 0; i < rgbs.length; i++) for (let j = i+1; j < rgbs.length; j++) {
-        const d = Math.sqrt((rgbs[i].r-rgbs[j].r)**2+(rgbs[i].g-rgbs[j].g)**2+(rgbs[i].b-rgbs[j].b)**2)/441.7;
-        total += d < 0.15 ? 95 : d > 0.55 ? 88 : Math.max(30, 85 - d*100); pairs++;
-      }
-      return Math.round(total / pairs);
-    }
-    function passesNoteFilter(pieces) {
-      if (!notes) return true;
-      const text = pieces.map(p => `${getName(p)} ${getColor(p)}`).join(' ').toLowerCase();
-      const noMatch = notes.match(/no\s+(\w+)/g);
-      if (noMatch) for (const m of noMatch) { if (text.includes(m.replace('no ', ''))) return false; }
-      if (notes.includes('all black') || notes.includes('dark')) {
-        if (['white','cream','beige','yellow','pink','light'].some(c => text.includes(c))) return false;
-      }
-      return true;
-    }
-
-    let best = null, bestScore = -1;
-    for (let attempt = 0; attempt < 60; attempt++) {
-      const top    = shuffle(byRole.top)[0];
-      const bottom = shuffle(byRole.bottom)[0];
-      const shoes  = shuffle(byRole.shoes)[0];
-      const layer  = byRole.layer.length && Math.random() > 0.75 ? shuffle(byRole.layer)[0] : null;
-      const pieces = [top, bottom, shoes, layer].filter(Boolean);
-      if (isBanned(pieces) || !passesNoteFilter(pieces)) continue;
-      const score = harmonyScore(pieces);
-      if (score > bestScore) { bestScore = score; best = pieces; if (score >= 88) break; }
-    }
-    if (!best) {
-      const top = shuffle(byRole.top)[0], bottom = shuffle(byRole.bottom)[0], shoes = shuffle(byRole.shoes)[0];
-      best = [top, bottom, shoes]; bestScore = harmonyScore(best);
-    }
-
-    const pieceNames    = best.map(getName);
-    const confidence    = Math.min(bestScore / 100, 1.0);
-    const closetSummary = best.map(p => `${getName(p)} (${getColor(p)}, ${getType(p)})`).join(', ');
-
-    const description = await ask(
-      `You are a fashion stylist. Given a specific outfit, write a creative name, vibe, why it works, and one wearing tip. Be specific and confident. Return ONLY valid JSON.`,
-      `Occasion: ${occasion}. Weather: ${weather}.${notes ? ` User note: "${notes}".` : ''}
-Outfit: ${closetSummary}
-
-JSON:
-{"name":"<2-4 word creative name>","vibe":"<one sentence mood>","why_it_works":"<color/silhouette logic>","stylist_tip":"<one actionable tip>"}`,
-      true, 250, FAST
-    );
-    let desc = { name: 'CLEAN BUILD', vibe: '', why_it_works: '', stylist_tip: '' };
-    try { desc = JSON.parse(description); } catch (_) {}
-
-    log('/api/outfits', 200, Date.now()-t0, `score=${bestScore} pieces=${best.length}`);
-    res.json({ outfit: { name: desc.name || 'CLEAN BUILD', pieces: pieceNames, vibe: desc.vibe || '', why_it_works: desc.why_it_works || '', stylist_tip: desc.stylist_tip || '', confidence }, source: 'smart_randomizer' });
-  } catch (e) {
-    log('/api/outfits', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Outfit generation failed.' });
+    const profile = req.body;
+    const prompt = `You are an elite life-optimization AI. Generate a tight daily schedule for:
+${JSON.stringify(profile, null, 2)}
+Return a JSON array of { time, activity, duration, category } objects. Be specific and motivating.`;
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      max_tokens: 1500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
+    res.json({ schedule: JSON.parse(raw) });
+  } catch (err) {
+    console.error('[/schedule]', err.message);
+    res.status(500).json({ schedule: [] });
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// GRIND BROWSER — Accounts, Profiles, AI Coach
-// ══════════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────
+//  INDEX — curriculum routes
+//  POST /ai/curriculum/build   { topic }
+//  POST /ai/curriculum/expand  { topic, unitIndex, unitTitle }
+//  POST /ai/curriculum/chat    { topic, messages }
+// ─────────────────────────────────────────────────────────────
+app.post('/ai/curriculum/build', async (req, res) => {
+  try {
+    const { topic } = req.body;
+    const prompt = `Create a 5-unit course outline for: "${topic}".
+Return JSON only: { title, description, units: [{ title, emoji, objective }] }
+Exactly 5 units. No markdown.`;
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o', max_tokens: 2500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
+    res.json(JSON.parse(raw));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-const GRIND_USERS    = {};
-const GRIND_PROFILES = {};
+app.post('/ai/curriculum/expand', async (req, res) => {
+  try {
+    const { topic, unitIndex, unitTitle } = req.body;
+    const prompt = `For the course "${topic}", unit ${unitIndex+1}: "${unitTitle}".
+Generate 3 learn cards and 5 exercises.
+Return JSON only: { learnCards: [{ type, concept, keyFact, analogy }], exercises: [{ type, question, options, answer, explanation }] }
+Exercise types: multiple_choice, true_false, fill_blank, code_output, arrange. No markdown.`;
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o', max_tokens: 2000,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
+    res.json(JSON.parse(raw));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
-function grindAuth(req, res, next) {
-  const auth = req.headers.authorization;
-  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'No token provided.' });
-  try { req.grindUser = jwt.verify(auth.split(' ')[1], JWT_SECRET); next(); }
-  catch (e) { res.status(401).json({ error: 'Invalid or expired token.' }); }
+app.post('/ai/curriculum/chat', async (req, res) => {
+  try {
+    const { topic, messages } = req.body;
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o', max_tokens: 800,
+      messages: [
+        { role: 'system', content: `You are a tutor for the course: "${topic}". Be concise and clear.` },
+        ...(messages || []),
+      ],
+    });
+    res.json({ reply: completion.choices[0].message.content });
+  } catch (err) {
+    res.status(500).json({ reply: 'AI offline.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  WARDROBE — outfit generation (2AM-aware, 45% 2AM inclusion)
+//  POST /api/outfits  { closet: [{ id, name, type, brand, color, pattern }], mood?, occasion? }
+// ─────────────────────────────────────────────────────────────
+app.post('/api/outfits', async (req, res) => {
+  try {
+    const { closet = [], mood, occasion } = req.body;
+
+    // Separate 2AM pieces from everything else
+    const twoAmPieces  = closet.filter(i => i.brand === '2AM');
+    const otherPieces  = closet.filter(i => i.brand !== '2AM');
+
+    // Build 2AM catalog context for the AI
+    const catalogContext = TWO_AM_CATALOG.map(p =>
+      `- ${p.name} (${p.type}) | Colors: ${p.colorNames.join(', ')} | Patterns: ${p.patterns.join(', ')}`
+    ).join('\n');
+
+    const prompt = `You are a streetwear stylist for Night.inc. The brand 2AM makes ONLY dark/black pieces (void black, deep black, washed black, charcoal) with motifs like oversized graphics, chest embroidery, dropped shoulders, side tape, minimal wordmarks.
+
+2AM catalog (only these exact pieces can be recognized as 2AM):
+${catalogContext}
+
+User's closet:
+2AM pieces: ${JSON.stringify(twoAmPieces)}
+Other pieces: ${JSON.stringify(otherPieces)}
+
+Rules:
+1. Generate 3 outfit combinations.
+2. AT LEAST 1 outfit must include a 2AM piece (target: 2 out of 3 outfits use 2AM as the anchor).
+3. For 2AM pieces: describe styling notes specific to the actual color and pattern (e.g. "void black oversized graphic tee with chest logo").
+4. NEVER reference brand names other than 2AM. Describe other pieces by type/color only.
+5. Each outfit: name, 3-4 pieces, vibe description (1 sentence), 2AM_anchor: true/false.
+
+Return JSON only: { outfits: [{ name, pieces: [{ id, name, role }], vibe, twoAmAnchor }] }`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o', max_tokens: 1200,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
+    res.json(JSON.parse(raw));
+  } catch (err) {
+    console.error('[/api/outfits]', err.message);
+    res.status(500).json({ outfits: [] });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  WARDROBE — 2AM scanner recognition
+//  POST /api/wardrobe/scan  { imageBase64, colorSample: '#hex' }
+//  Returns confidence score + matched product if >= 80%
+// ─────────────────────────────────────────────────────────────
+app.post('/api/wardrobe/scan', async (req, res) => {
+  try {
+    const { imageBase64, colorSample, userDescription } = req.body;
+
+    const catalogDesc = TWO_AM_CATALOG.map(p =>
+      `ID: ${p.id} | Name: ${p.name} | Type: ${p.type} | Colors: ${p.colorNames.join(', ')} | Patterns: ${p.patterns.join(', ')} | Collection: ${p.collection}`
+    ).join('\n');
+
+    const neverMatch = TWO_AM_VISUAL_FINGERPRINTS.neverMatch.join(', ');
+
+    const messages = [];
+
+    // If we have an image, send it to vision
+    if (imageBase64) {
+      messages.push({
+        role: 'user',
+        content: [
+          {
+            type: 'image_url',
+            image_url: { url: `data:image/jpeg;base64,${imageBase64}`, detail: 'low' },
+          },
+          {
+            type: 'text',
+            text: `You are a 2AM clothing brand recognition AI. ONLY recognize items from the 2AM brand catalog below. NEVER recognize these brands: ${neverMatch}.
+
+2AM CATALOG:
+${catalogDesc}
+
+2AM design fingerprint:
+- Color palette: void black (#0a0a0a), deep black (#111111), washed black (#1a1a1a), charcoal (#2a2a2a), gold accent (#c8a96e)
+- Motifs: oversized graphics, chest embroidery, dropped shoulders, side tape, minimal wordmarks, ice graphics, night-themed prints
+- Always monochrome/dark palette
+
+Analyze this garment image. 
+1. Does it match 2AM's exact color palette and design language?
+2. Which catalog item is the closest match (if any)?
+3. Assign a confidence score 0-100.
+
+If confidence < 80: return { match: false, confidence: <score>, reason: "<why it doesn't match>" }
+If confidence >= 80: return { match: true, confidence: <score>, productId: "<id from catalog>", productName: "<name>", colorMatch: "<matched color name>", patternMatch: "<matched pattern>" }
+
+Return JSON only. No markdown.`,
+          },
+        ],
+      });
+    } else {
+      // Text-only fallback using description + color sample
+      messages.push({
+        role: 'user',
+        content: `2AM catalog: ${catalogDesc}
+User description: "${userDescription || 'no description'}"
+Dominant color from scanner: ${colorSample || 'unknown'}
+Does this match any 2AM piece at 80%+ confidence?
+Return JSON: { match: bool, confidence: number, productId: string|null, productName: string|null, colorMatch: string|null, patternMatch: string|null, reason: string }`,
+      });
+    }
+
+    const completion = await openai.chat.completions.create({
+      model: imageBase64 ? 'gpt-4o' : 'gpt-4o-mini',
+      max_tokens: 400,
+      messages,
+    });
+
+    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
+    const result = JSON.parse(raw);
+
+    // Attach full product data if matched
+    if (result.match && result.productId) {
+      result.product = TWO_AM_CATALOG.find(p => p.id === result.productId) || null;
+    }
+
+    res.json(result);
+  } catch (err) {
+    console.error('[/api/wardrobe/scan]', err.message);
+    res.status(500).json({ match: false, confidence: 0, reason: 'Scanner error.' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  WARDROBE — validate activation code
+//  POST /api/wardrobe/validate-code  { code }
+// ─────────────────────────────────────────────────────────────
+app.post('/api/wardrobe/validate-code', (req, res) => {
+  const { code } = req.body;
+  const entry = wardrobeCodes.get(code);
+  if (!entry) return res.status(404).json({ valid: false, reason: 'Code not found.' });
+  if (entry.claimed) return res.status(409).json({ valid: false, reason: 'Already claimed.' });
+
+  entry.claimed  = true;
+  entry.claimedAt = new Date().toISOString();
+  wardrobeSet(code, entry);
+
+  const product = TWO_AM_CATALOG.find(p => p.id === entry.productId);
+  res.json({ valid: true, product, orderId: entry.orderId });
+});
+
+// ─────────────────────────────────────────────────────────────
+//  WARDROBE — get 2AM catalog (for closet matching)
+//  GET /api/wardrobe/catalog
+// ─────────────────────────────────────────────────────────────
+app.get('/api/wardrobe/catalog', (req, res) => {
+  res.json({
+    catalog: TWO_AM_CATALOG,
+    visualFingerprints: TWO_AM_VISUAL_FINGERPRINTS,
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+//  PRINTIFY HELPER — fetch ALL pages of products
+// ─────────────────────────────────────────────────────────────
+async function fetchAllPrintifyProducts() {
+  const products = [];
+  let page = 1;
+  const shopId = process.env.PRINTIFY_SHOP_ID || '17605284';
+  while (true) {
+    const r = await fetch(
+      `https://api.printify.com/v1/shops/${shopId}/products.json?limit=50&page=${page}`,
+      { headers: { Authorization: `Bearer ${process.env.PRINTIFY_API_KEY}` } }
+    );
+    if (!r.ok) break;
+    const data = await r.json();
+    const items = data.data || [];
+    products.push(...items);
+    if (items.length < 50) break; // last page
+    page++;
+  }
+  return products;
 }
 
-app.post('/grind/account/create', grindLimiter, async (req, res) => {
-  const t0 = Date.now();
-  try {
-    const email    = strShort(req.body.email,    '').toLowerCase();
-    const password = strShort(req.body.password, '');
-    const name     = strShort(req.body.name,     '');
-    const username = strShort(req.body.username, '').toLowerCase().replace(/[^a-z0-9_]/g, '');
-    if (!email || !email.includes('@')) return res.status(400).json({ error: 'Valid email required.' });
-    if (!password || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
-    if (GRIND_USERS[email]) return res.status(409).json({ error: 'An account with this email already exists.' });
-    const hash  = await bcrypt.hash(password, 10);
-    GRIND_USERS[email] = { hash, name, username, createdAt: Date.now() };
-    const token = jwt.sign({ email, name, username }, JWT_SECRET, { expiresIn: '365d' });
-    log('/grind/account/create', 200, Date.now()-t0, `user=${email}`);
-    res.json({ token, user: { email, name, username } });
-  } catch (e) {
-    log('/grind/account/create', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Account creation failed.' });
-  }
-});
+// Normalize a raw Printify product into a clean store product object.
+// Only products tagged 'showfloor' are shown.
+// Price: use retail_price (already in dollars as float) from the first enabled variant.
+// Never use internal cost — only what the customer pays.
+function normalizePrintifyProduct(p) {
+  // Only enabled variants
+  const enabledVariants = (p.variants || []).filter(v => v.is_enabled);
+  if (enabledVariants.length === 0) return null;
 
-app.post('/grind/account/login', grindLimiter, async (req, res) => {
-  const t0 = Date.now();
-  try {
-    const email    = strShort(req.body.email,    '').toLowerCase();
-    const password = strShort(req.body.password, '');
-    const user = GRIND_USERS[email];
-    if (!user) return res.status(404).json({ error: 'No account found with this email.' });
-    const ok = await bcrypt.compare(password, user.hash);
-    if (!ok) return res.status(401).json({ error: 'Incorrect password.' });
-    const token = jwt.sign({ email, name: user.name, username: user.username }, JWT_SECRET, { expiresIn: '365d' });
-    log('/grind/account/login', 200, Date.now()-t0, `user=${email}`);
-    res.json({ token, user: { email, name: user.name, username: user.username } });
-  } catch (e) {
-    log('/grind/account/login', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Login failed.' });
+  // retail_price is a float in dollars (e.g. 38.00). If missing fall back to
+  // price field which Printify returns in cents when >500, dollars otherwise.
+  const firstVariant = enabledVariants[0];
+  let retailPriceDollars;
+  if (firstVariant.retail_price != null) {
+    // retail_price is already dollars
+    retailPriceDollars = parseFloat(firstVariant.retail_price);
+  } else if (firstVariant.price != null) {
+    const raw = parseFloat(firstVariant.price);
+    // Printify sometimes returns price in cents (>500) vs dollars
+    retailPriceDollars = raw > 500 ? raw / 100 : raw;
+  } else {
+    retailPriceDollars = 0;
   }
-});
 
-app.post('/grind/profile/sync', grindAuth, grindLimiter, (req, res) => {
-  const t0 = Date.now();
-  try {
-    const { email } = req.grindUser;
-    const profile   = req.body.profile   || {};
-    const bookmarks = Array.isArray(req.body.bookmarks) ? req.body.bookmarks.slice(0, 200) : [];
-    const history   = Array.isArray(req.body.history)   ? req.body.history.slice(0, 100)   : [];
-    const { token: _tok, ...safeProfile } = profile;
-    GRIND_PROFILES[email] = { profile: safeProfile, bookmarks, history, updatedAt: Date.now() };
-    log('/grind/profile/sync', 200, Date.now()-t0, `user=${email}`);
-    res.json({ ok: true, synced: Date.now() });
-  } catch (e) {
-    log('/grind/profile/sync', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Sync failed.' });
-  }
-});
+  // Collect unique size options across enabled variants
+  const sizes = [...new Set(
+    enabledVariants
+      .map(v => v.title || v.label || '')
+      .filter(t => /^(XS|S|M|L|XL|XXL|OS|S\/M|L\/XL)/i.test(t))
+  )];
 
-app.get('/grind/profile/load', grindAuth, grindLimiter, (req, res) => {
-  const t0 = Date.now();
-  try {
-    const { email } = req.grindUser;
-    const data = GRIND_PROFILES[email];
-    if (!data) return res.json({ profile: null, bookmarks: [], history: [] });
-    log('/grind/profile/load', 200, Date.now()-t0, `user=${email}`);
-    res.json(data);
-  } catch (e) {
-    log('/grind/profile/load', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Load failed.' });
-  }
-});
+  // Collect color options
+  const colors = [...new Set(
+    enabledVariants
+      .map(v => (v.options || []).find(o => o.type === 'color')?.title || v.title || '')
+      .filter(Boolean)
+  )];
 
-app.post('/grind/coach', aiLimiter, async (req, res) => {
-  const t0 = Date.now();
+  // Best image
+  const image = p.images?.[0]?.src || null;
+
+  // Map Printify category to internal type
+  const titleLower = (p.title || '').toLowerCase();
+  let type = 'tee';
+  if (/hoodie|sweat/i.test(titleLower))    type = 'hoodie';
+  else if (/jogger|pant|trouser/i.test(titleLower)) type = 'bottoms';
+  else if (/short/i.test(titleLower))      type = 'shorts';
+  else if (/cap|hat|beanie/i.test(titleLower)) type = 'headwear';
+  else if (/jacket|coat/i.test(titleLower)) type = 'jacket';
+
+  return {
+    id:          p.id,
+    printifyId:  p.id,
+    name:        p.title,
+    description: p.description || '',
+    type,
+    collection:  (p.tags || []).find(t => !['showfloor','tapstitch'].includes(t)) || 'CORE',
+    // price in cents for consistent internal handling
+    price:       Math.round(retailPriceDollars * 100),
+    // also expose dollars directly so frontend never has to guess
+    priceDollars: retailPriceDollars.toFixed(2),
+    colors,
+    sizes,
+    image,
+    tags:        p.tags || [],
+    inStock:     enabledVariants.some(v => v.is_available !== false),
+    variants:    enabledVariants.map(v => ({
+      id:    v.id,
+      title: v.title,
+      price: Math.round(
+        v.retail_price != null
+          ? parseFloat(v.retail_price) * 100
+          : (parseFloat(v.price) > 500 ? parseFloat(v.price) : parseFloat(v.price) * 100)
+      ),
+      priceDollars: v.retail_price != null
+        ? parseFloat(v.retail_price).toFixed(2)
+        : (parseFloat(v.price) > 500 ? (parseFloat(v.price)/100).toFixed(2) : parseFloat(v.price).toFixed(2)),
+    })),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+//  2AM STORE — product listing
+//  GET /api/store/products
+//  Returns only products tagged 'showfloor', with real retail prices.
+// ─────────────────────────────────────────────────────────────
+app.get('/api/store/products', async (req, res) => {
   try {
-    const message = strShort(req.body.message, '');
-    const context = strShort(req.body.context, '');
-    if (!message) return res.status(400).json({ error: 'Message is required.' });
-    const reply = await ask(
-      `You are a sharp, direct AI productivity coach built into GRIND Browser — a browser for builders, students, and young founders. ${context ? `User context: ${context}` : ''}
-Rules: Max 2 sentences. No fluff. Be real, not motivational-poster. Give actionable advice. If they're off task, call it out.`,
-      message, false, 120, FAST
+    if (!process.env.PRINTIFY_API_KEY) {
+      return res.json({ products: TWO_AM_CATALOG.filter(p => p.inStock), source: 'catalog' });
+    }
+
+    const all = await fetchAllPrintifyProducts();
+
+    // Only showfloor-tagged products
+    const showFloor = all.filter(p =>
+      Array.isArray(p.tags) && p.tags.includes('showfloor')
     );
-    log('/grind/coach', 200, Date.now()-t0);
-    res.json({ reply });
-  } catch (e) {
-    log('/grind/coach', 500, Date.now()-t0, e.message);
-    res.status(500).json({ error: 'Coach unavailable.' });
+
+    // Normalize and drop any that have no enabled variants
+    const normalized = showFloor
+      .map(normalizePrintifyProduct)
+      .filter(Boolean)
+      .filter(p => p.inStock);
+
+    return res.json({ products: normalized, source: 'printify', count: normalized.length });
+  } catch (err) {
+    console.error('[/api/store/products]', err.message);
+    res.json({ products: TWO_AM_CATALOG.filter(p => p.inStock), source: 'catalog' });
   }
 });
 
-// ─── 404 & error handlers ─────────────────────────────────────────────────────
-app.use((req, res) => res.status(404).json({ error: 'Route not found.' }));
-app.use((err, req, res, next) => {
-  console.error(`[${new Date().toISOString()}] Unhandled error:`, err.message);
-  res.status(500).json({ error: 'Something went wrong.' });
+// ─────────────────────────────────────────────────────────────
+//  2AM STORE — create Stripe checkout session
+//  POST /api/store/checkout
+//  { items: [{ productId, printifyId, variantId, name, price, quantity, size }] }
+//  price must be in cents (Printify retail_price * 100)
+// ─────────────────────────────────────────────────────────────
+app.post('/api/store/checkout', async (req, res) => {
+  try {
+    const { items = [], customerEmail } = req.body;
+
+    for (const item of items) {
+      if (!item.price || item.price <= 0) {
+        return res.status(400).json({ error: `Missing price for: ${item.name}` });
+      }
+    }
+
+    const lineItems = items.map(item => ({
+      price_data: {
+        currency: 'usd',
+        product_data: {
+          name: `${item.name}${item.size ? ' \u2014 ' + item.size : ''}`,
+          metadata: {
+            productId:  item.productId  || '',
+            printifyId: String(item.printifyId || ''),
+            variantId:  String(item.variantId  || ''),
+            size:       item.size || '',
+          },
+        },
+        unit_amount: item.price, // cents — actual Printify retail price
+      },
+      quantity: item.quantity || 1,
+    }));
+
+    const shippingCents = 499 + Math.max(0, items.length - 1) * 150;
+    lineItems.push({
+      price_data: {
+        currency: 'usd',
+        product_data: { name: 'Standard Shipping (5-8 business days)' },
+        unit_amount: shippingCents,
+      },
+      quantity: 1,
+    });
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: lineItems,
+      mode: 'payment',
+      customer_email: customerEmail || undefined,
+      success_url: 'https://2amcases.com/order-confirmation?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url:  'https://2amcases.com/catalog.html',
+      metadata: {
+        items: JSON.stringify(items.map(i => ({
+          productId:  i.productId,
+          printifyId: i.printifyId,
+          variantId:  i.variantId,
+          size:       i.size,
+          name:       i.name,
+        }))),
+      },
+    });
+
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (err) {
+    console.error('[/api/store/checkout]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
+
+
+// ─────────────────────────────────────────────────────────────
+//  2AM STORE — Stripe webhook (order fulfillment + WARDROBE codes)
+//  POST /webhook/stripe
+// ─────────────────────────────────────────────────────────────
+app.post('/webhook/stripe', async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const items   = JSON.parse(session.metadata?.items || '[]');
+
+    for (const item of items) {
+      const code    = generateWardrobeCode();
+      const orderId = session.id;
+
+      // Store the code (persisted to disk)
+      wardrobeSet(code, {
+        productId: item.productId,
+        orderId,
+        claimed: false,
+        createdAt: new Date().toISOString(),
+      });
+
+      // If Printify product, submit order
+      if (process.env.PRINTIFY_API_KEY && item.printifyId) {
+        try {
+          // Map Stripe shipping_details to Printify's required address format
+          const sd   = session.shipping_details || {};
+          const addr = sd.address || {};
+          const nameParts = (sd.name || '').trim().split(/\s+/);
+          const printifyAddress = {
+            first_name:   nameParts[0] || 'Customer',
+            last_name:    nameParts.slice(1).join(' ') || 'Night.inc',
+            email:        session.customer_email || '',
+            phone:        '',
+            country_code: addr.country || 'US',
+            region:       addr.state   || '',
+            address1:     addr.line1   || '',
+            address2:     addr.line2   || '',
+            city:         addr.city    || '',
+            zip:          addr.postal_code || '',
+          };
+
+          await fetch(`https://api.printify.com/v1/shops/${process.env.PRINTIFY_SHOP_ID}/orders.json`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${process.env.PRINTIFY_API_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              external_id:     orderId,
+              line_items:      [{ product_id: item.printifyId, variant_id: item.variantId, quantity: 1 }],
+              shipping_method: 1,
+              address_to:      printifyAddress,
+            }),
+          });
+        } catch (e) {
+          console.error('[Printify order]', e.message);
+        }
+      }
+
+      console.log(`[Order] ${orderId} → code ${code} for product ${item.productId}`);
+    }
+  }
+
+  res.json({ received: true });
+});
+
+// ─────────────────────────────────────────────────────────────
+//  2AM STORE — order confirmation (called by confirmation page)
+//  GET /api/store/order?session_id=...
+// ─────────────────────────────────────────────────────────────
+app.get('/api/store/order', async (req, res) => {
+  try {
+    const { session_id } = req.query;
+    const session = await stripe.checkout.sessions.retrieve(session_id, {
+      expand: ['line_items'],
+    });
+
+    // Find WARDROBE codes for this order
+    const codes = [];
+    for (const [code, entry] of wardrobeCodes.entries()) {
+      if (entry.orderId === session_id) {
+        const product = TWO_AM_CATALOG.find(p => p.id === entry.productId);
+        codes.push({ code, product, claimed: entry.claimed });
+      }
+    }
+
+    res.json({
+      orderId: session.id,
+      customerEmail: session.customer_email,
+      total: session.amount_total,
+      status: session.payment_status,
+      items: session.line_items?.data || [],
+      wardrobeCodes: codes,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  KINETIC — AI meal plan
+//  POST /api/kinetic/meal  { calories, macros, restrictions }
+// ─────────────────────────────────────────────────────────────
+app.post('/api/kinetic/meal', async (req, res) => {
+  try {
+    const { calories, macros, restrictions } = req.body;
+    const prompt = `Generate a 1-day meal plan for ${calories} calories.
+Macros target: ${JSON.stringify(macros)}.
+Restrictions: ${restrictions || 'none'}.
+Return JSON: { meals: [{ name, calories, protein, carbs, fat, time }] }`;
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o', max_tokens: 800,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
+    res.json(JSON.parse(raw));
+  } catch (err) {
+    res.status(500).json({ meals: [] });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  AURA — skin analysis
+//  POST /api/aura/analyze  { imageBase64, skinConcerns, environment }
+// ─────────────────────────────────────────────────────────────
+app.post('/api/aura/analyze', async (req, res) => {
+  try {
+    const { imageBase64, skinConcerns, environment } = req.body;
+    const messages = imageBase64
+      ? [{
+          role: 'user',
+          content: [
+            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}`, detail: 'low' } },
+            { type: 'text', text: `Analyze this face image for skin health. Concerns: ${skinConcerns || 'general'}. Environment: ${JSON.stringify(environment || {})}. Return JSON: { score: 0-100, issues: [], routine: [{ step, product, when }], tips: [] }` },
+          ],
+        }]
+      : [{ role: 'user', content: `Skin analysis for concerns: ${skinConcerns}. Return JSON: { score: 0-100, issues: [], routine: [], tips: [] }` }];
+
+    const completion = await openai.chat.completions.create({
+      model: imageBase64 ? 'gpt-4o' : 'gpt-4o-mini',
+      max_tokens: 800,
+      messages,
+    });
+    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
+    res.json(JSON.parse(raw));
+  } catch (err) {
+    res.status(500).json({ score: 0, issues: [], routine: [], tips: [] });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  NEXUS — idea action plan
+//  POST /api/nexus/idea  { idea, businessName }
+// ─────────────────────────────────────────────────────────────
+app.post('/api/nexus/idea', async (req, res) => {
+  try {
+    const { idea, businessName } = req.body;
+    const prompt = `You are a sharp business strategist. The founder runs "${businessName}". 
+Idea: "${idea}". 
+Create a concise action plan. Return JSON: { summary, steps: [{ action, timeline, effort }], risks: [], verdict: 'hot'|'test'|'skip' }`;
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o', max_tokens: 600,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
+    res.json(JSON.parse(raw));
+  } catch (err) {
+    res.status(500).json({ summary: 'AI offline', steps: [], risks: [], verdict: 'skip' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+//  APEX — streak engine
+//
+//  Rules:
+//    1. Streak only increments if founderKeyActive === true
+//       (biometric Founder-Key must be active — no key, no log)
+//    2. Midnight reset uses Florida / Eastern Time (handles DST)
+//    3. Chris Mode: 12-hour grace window
+//       If chrisMode === true, the "yesterday" check extends to
+//       36 hours since last log instead of 24 — so logging at
+//       2AM after midnight still counts as the previous day's log
+//    4. Double-logging on the same day is a no-op (idempotent)
+//
+//  POST /api/apex/streak/log   { userId, founderKeyActive, chrisMode? }
+//  GET  /api/apex/streak/:userId
+//  POST /api/apex/streak/reset { userId }   (dev/admin only — no prod exposure without auth)
+// ─────────────────────────────────────────────────────────────
+
+// File-persisted streak store (survives Railway restarts)
+const STREAKS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'apex_streaks.json');
+
+function readStreaksFile() {
+  try { return JSON.parse(fs.readFileSync(STREAKS_FILE, 'utf8')); }
+  catch { return {}; }
+}
+function writeStreaksFile(data) {
+  try { fs.writeFileSync(STREAKS_FILE, JSON.stringify(data), 'utf8'); }
+  catch (e) { console.error('[apex-streaks] write error:', e.message); }
+}
+
+const apexStreaks = new Map(Object.entries(readStreaksFile()));
+console.log(`[apex-streaks] Loaded ${apexStreaks.size} streak(s) from disk.`);
+
+function streakSet(userId, entry) {
+  apexStreaks.set(userId, entry);
+  writeStreaksFile(Object.fromEntries(apexStreaks));
+}
+
+// Returns today's date string in Eastern Time (Florida), e.g. "2026-06-10"
+// Uses Intl to handle DST automatically — no manual offset math
+function getEasternDateString(date = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', { // en-CA gives YYYY-MM-DD format
+    timeZone: 'America/New_York',
+  }).format(date);
+}
+
+app.post('/api/apex/streak/log', (req, res) => {
+  const { userId = 'default', founderKeyActive = false, chrisMode = false } = req.body;
+
+  // Gate 1: Founder-Key required
+  if (!founderKeyActive) {
+    const current = apexStreaks.get(userId);
+    return res.status(403).json({
+      logged:   false,
+      reason:   'Founder-Key biometric required to log streak.',
+      streak:   current?.streak ?? 0,
+      lastLogDate: current?.lastLogDate ?? null,
+    });
+  }
+
+  const now     = new Date();
+  const todayET = getEasternDateString(now);
+  const existing = apexStreaks.get(userId);
+
+  // No prior record — first-ever log
+  if (!existing) {
+    streakSet(userId, { streak: 1, lastLogDate: todayET, chrisMode, updatedAt: now.toISOString() });
+    return res.json({ logged: true, streak: 1, continued: false, firstLog: true, date: todayET });
+  }
+
+  // Already logged today — idempotent, no change
+  if (existing.lastLogDate === todayET) {
+    return res.json({ logged: false, reason: 'Already logged today.', streak: existing.streak, date: todayET });
+  }
+
+  // Compute hours since last log to decide whether streak continues
+  const lastLogTime   = new Date(existing.updatedAt);
+  const hoursSinceLast = (now - lastLogTime) / (1000 * 60 * 60);
+
+  // Standard window: 24h–48h gap means yesterday's date is the last log
+  // Chris Mode grace: extends window to 36h (12-hour grace past midnight)
+  const windowHours = chrisMode ? 36 : 28; // 28h = small normal buffer past midnight
+
+  if (hoursSinceLast <= windowHours) {
+    // Streak continues
+    const newStreak = existing.streak + 1;
+    streakSet(userId, { streak: newStreak, lastLogDate: todayET, chrisMode, updatedAt: now.toISOString() });
+    return res.json({ logged: true, streak: newStreak, continued: true, chrisMode, date: todayET });
+  } else {
+    // Streak broken — reset to 1
+    streakSet(userId, { streak: 1, lastLogDate: todayET, chrisMode, updatedAt: now.toISOString() });
+    return res.json({ logged: true, streak: 1, continued: false, streakReset: true, date: todayET });
+  }
+});
+
+app.get('/api/apex/streak/:userId', (req, res) => {
+  const { userId } = req.params;
+  const data = apexStreaks.get(userId);
+
+  if (!data) {
+    return res.json({ userId, streak: 0, lastLogDate: null, active: false });
+  }
+
+  const todayET = getEasternDateString();
+  // "active" = user has already logged today
+  const active = data.lastLogDate === todayET;
+
+  res.json({
+    userId,
+    streak:         data.streak,
+    lastLogDate:    data.lastLogDate,
+    active,
+    chrisMode:      data.chrisMode,
+    updatedAt:      data.updatedAt,
+    todayET,
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+//  START
+// ─────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`[${new Date().toISOString()}] Night.inc backend → port ${PORT}`);
-  console.log(`Auth: ${APP_SECRET ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Night.inc Unified Backend running on port ${PORT}`);
+  console.log(`Apps served: APEX (streak engine) · WARDROBE · INDEX · NEXUS · KINETIC · AURA · 2AM`);
 });
