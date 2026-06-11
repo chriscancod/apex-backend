@@ -1,273 +1,210 @@
-// ============================================================
-//  NIGHT.INC UNIFIED BACKEND — server.js
-//  Serves: APEX · WARDROBE · INDEX · NEXUS · KINETIC · AURA · 2AM
-//  Deploy on Railway. Set env vars:
-//    OPENAI_API_KEY, PRINTIFY_API_KEY, PRINTIFY_SHOP_ID,
-//    STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, APEX_APP_SECRET
-// ============================================================
+// ═══════════════════════════════════════════════════════════════
+//  NIGHT.INC  —  UNIFIED BACKEND  server.js
+//  One Railway deployment. Every app routes here.
+//
+//  APPS SERVED:
+//    APEX     →  POST /schedule  ·  POST /api/chat
+//    NEXUS    →  POST /api/chat
+//    AURA     →  POST /api/chat
+//    KINETIC  →  POST /api/chat
+//    INDEX    →  POST /ai/curriculum/build  ·  POST /ai/curriculum/expand  ·  POST /ai/curriculum/chat
+//    WARDROBE →  POST /api/outfits  ·  POST /api/wardrobe/scan  ·  POST /api/wardrobe/validate-code  ·  GET /api/wardrobe/catalog
+//    2AM      →  GET  /api/store/products  ·  POST /api/store/checkout  ·  POST /webhook/stripe  ·  GET /api/store/order
+//
+//  ENV VARS (set in Railway):
+//    OPENAI_API_KEY         — required by all AI routes
+//    PRINTIFY_API_KEY       — required by 2AM store
+//    PRINTIFY_SHOP_ID       — your Printify shop ID (17605284)
+//    STRIPE_SECRET_KEY      — required by checkout
+//    STRIPE_WEBHOOK_SECRET  — required by /webhook/stripe
+// ═══════════════════════════════════════════════════════════════
 
-const express    = require('express');
-const cors       = require('cors');
-const bodyParser = require('body-parser');
-const OpenAI     = require('openai');
-const Stripe     = require('stripe');
-const crypto     = require('crypto');
-const fs         = require('fs');
-const path       = require('path');
+const express = require('express');
+const cors    = require('cors');
+const crypto  = require('crypto');
+const OpenAI  = require('openai');
+const Stripe  = require('stripe');
 
 const app    = express();
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 90000 });
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 90_000 });
+const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
-app.use(cors());
-// Raw body needed for Stripe webhooks — must come before json parser
+// Stripe webhook needs raw body — must come BEFORE express.json()
 app.use('/webhook/stripe', express.raw({ type: 'application/json' }));
-app.use(bodyParser.json({ limit: '10mb' }));
-
-// ─────────────────────────────────────────────────────────────
-//  2AM PRODUCT CATALOG
-//  Single source of truth used by: store, WARDROBE scanner,
-//  outfit engine, order confirmation sync
-// ─────────────────────────────────────────────────────────────
-const TWO_AM_CATALOG = [
-  {
-    id: 'iceman-tee-blk',
-    name: 'ICEMAN Tee',
-    collection: 'ICEMAN',
-    type: 'tee',
-    price: 3800,
-    colors: ['#0a0a0a','#1a1a1a'],
-    colorNames: ['Black','Washed Black'],
-    patterns: ['graphic-front','minimal-back','chest-logo'],
-    printifyId: null,
-    inStock: true,
-    images: ['https://2amcases.com/assets/iceman-tee-blk.jpg'],
-    tags: ['showfloor','tshirt'],
-    description: 'ICEMAN graphic tee. Heavyweight 300gsm. Dropped shoulders.',
-  },
-  {
-    id: 'og-hoodie-blk',
-    name: '2AM OG Hoodie',
-    collection: 'CORE',
-    type: 'hoodie',
-    price: 6800,
-    colors: ['#0a0a0a'],
-    colorNames: ['Black'],
-    patterns: ['embroidered-chest','clean-back','ribbed-cuffs'],
-    printifyId: null,
-    inStock: true,
-    images: ['https://2amcases.com/assets/og-hoodie-blk.jpg'],
-    tags: ['showfloor','hoodie'],
-    description: 'The original. 400gsm fleece. 2AM chest embroidery.',
-  },
-  {
-    id: 'night-joggers-blk',
-    name: 'Night Joggers',
-    collection: 'CORE',
-    type: 'bottoms',
-    price: 5200,
-    colors: ['#0a0a0a','#2a2a2a'],
-    colorNames: ['Black','Charcoal'],
-    patterns: ['side-tape','ankle-rib','minimal-logo'],
-    printifyId: null,
-    inStock: true,
-    images: ['https://2amcases.com/assets/night-joggers-blk.jpg'],
-    tags: ['showfloor','pants'],
-    description: 'Technical jogger. Tapered fit. Side tape detail.',
-  },
-  {
-    id: 'cargo-shorts-blk',
-    name: '2AM Cargo Shorts',
-    collection: 'SUMMER',
-    type: 'bottoms',
-    price: 4400,
-    colors: ['#0a0a0a'],
-    colorNames: ['Black'],
-    patterns: ['cargo-pockets','logo-tab','clean-hem'],
-    printifyId: null,
-    inStock: true,
-    images: ['https://2amcases.com/assets/cargo-shorts-blk.jpg'],
-    tags: ['showfloor','shorts'],
-    description: '6-pocket cargo. Utility meets clean aesthetic.',
-  },
-  {
-    id: 'night-cap-blk',
-    name: 'Night Cap 6-Panel',
-    collection: 'CORE',
-    type: 'headwear',
-    price: 2800,
-    colors: ['#0a0a0a','#c8a96e'],
-    colorNames: ['Black','Black/Tan'],
-    patterns: ['embroidered-front','clean-back','unstructured'],
-    printifyId: null,
-    inStock: true,
-    images: ['https://2amcases.com/assets/night-cap-blk.jpg'],
-    tags: ['showfloor','hat'],
-    description: 'Unstructured 6-panel. 2AM embroidered front.',
-  },
-  {
-    id: 'iceman-vol2-tee-blk',
-    name: 'ICEMAN Vol.2 Tee',
-    collection: 'ICEMAN',
-    type: 'tee',
-    price: 3800,
-    colors: ['#0a0a0a','#111111','#1a1a2e','#0d1117'],
-    colorNames: ['Black','Off Black','Midnight Navy','Void'],
-    patterns: ['oversized-graphic','ice-print','back-text','sleeve-hit'],
-    printifyId: null,
-    inStock: true,
-    images: ['https://2amcases.com/assets/iceman-v2-blk.jpg'],
-    tags: ['showfloor','tshirt','new'],
-    description: 'Vol.2. Bigger graphic. Same energy.',
-  },
-];
-
-// Visual fingerprints for scanner recognition (80% match threshold)
-const TWO_AM_VISUAL_FINGERPRINTS = {
-  colorPalette: [
-    { hex: '#0a0a0a', name: 'Void Black',    weight: 0.40 },
-    { hex: '#111111', name: 'Deep Black',    weight: 0.25 },
-    { hex: '#1a1a1a', name: 'Washed Black',  weight: 0.15 },
-    { hex: '#2a2a2a', name: 'Charcoal',      weight: 0.10 },
-    { hex: '#c8a96e', name: 'Gold Accent',   weight: 0.05 },
-    { hex: '#ffffff', name: 'White Hit',     weight: 0.05 },
-  ],
-  designMotifs: [
-    'large-chest-graphic', 'minimal-wordmark', 'dropped-shoulder',
-    'oversized-fit', 'embroidered-logo', 'side-tape', 'ribbed-hem',
-    'ice-graphic', 'night-themed-print', 'monochrome-palette',
-  ],
-  neverMatch: [
-    'supreme', 'nike', 'adidas', 'off-white', 'palace', 'stussy',
-    'fear-of-god', 'essentials', 'champion', 'carhartt', 'stone-island',
-  ],
-};
-
-// ─────────────────────────────────────────────────────────────
-//  WARDROBE CODE STORE  (file-persisted — survives Railway restarts)
-//  Upgrade path: swap readCodesFile/writeCodesFile for Redis/Supabase
-// ─────────────────────────────────────────────────────────────
-const CODES_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'wardrobe_codes.json');
-
-function readCodesFile() {
-  try {
-    return JSON.parse(fs.readFileSync(CODES_FILE, 'utf8'));
-  } catch {
-    return {};
-  }
-}
-
-function writeCodesFile(data) {
-  try {
-    fs.writeFileSync(CODES_FILE, JSON.stringify(data), 'utf8');
-  } catch (e) {
-    console.error('[wardrobe-persist] write error:', e.message);
-  }
-}
-
-// Warm in-memory Map from disk on startup
-const _codesRaw = readCodesFile();
-const wardrobeCodes = new Map(Object.entries(_codesRaw));
-console.log(`[wardrobe-persist] Loaded ${wardrobeCodes.size} code(s) from disk.`);
-
-function wardrobeSet(code, entry) {
-  wardrobeCodes.set(code, entry);
-  // Write entire map to disk after every mutation — small dataset, safe
-  writeCodesFile(Object.fromEntries(wardrobeCodes));
-}
-
-function generateWardrobeCode() {
-  const seg1 = crypto.randomBytes(2).toString('hex').toUpperCase();
-  const seg2 = Math.floor(Math.random() * 900 + 100).toString();
-  return `WARDROBE-${seg1}-${seg2}`;
-}
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
 
 // ─────────────────────────────────────────────────────────────
 //  HEALTH CHECK
 // ─────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
+app.get('/', (_req, res) => {
   res.json({
-    status: 'online',
     service: 'Night.inc Unified Backend',
-    version: '3.0.0',
-    apps: ['APEX','WARDROBE','INDEX','NEXUS','KINETIC','AURA','2AM'],
-    routes: {
-      apex:    ['/schedule','POST /api/apex/streak/log','GET /api/apex/streak/:userId'],
-      wardrobe:['/api/outfits','POST /api/wardrobe/scan','/api/wardrobe/validate-code','GET /api/wardrobe/catalog'],
-      index:   ['/ai/curriculum/build','/ai/curriculum/expand','/ai/curriculum/chat'],
-      nexus:   ['/api/nexus/idea'],
-      kinetic: ['/api/kinetic/meal'],
-      aura:    ['/api/aura/analyze'],
-      store:   ['GET /api/store/products','POST /api/store/checkout','GET /api/store/order','POST /webhook/stripe'],
-    },
-    timestamp: new Date().toISOString(),
+    version: '4.0.0',
+    status:  'online',
+    apps:    ['APEX', 'NEXUS', 'AURA', 'KINETIC', 'INDEX', 'WARDROBE', '2AM'],
   });
 });
 
 // ─────────────────────────────────────────────────────────────
-//  SHARED AI ENGINE  (used by ALL apps)
-//  POST /api/chat  { system, messages, app }
+//  SHARED HELPERS
 // ─────────────────────────────────────────────────────────────
+async function gpt(system, userOrMessages, { maxTokens = 1000, temp = 0.7 } = {}) {
+  const messages = Array.isArray(userOrMessages)
+    ? userOrMessages
+    : [{ role: 'user', content: userOrMessages }];
+  const res = await openai.chat.completions.create({
+    model: 'gpt-4o', max_tokens: maxTokens, temperature: temp,
+    messages: [{ role: 'system', content: system }, ...messages],
+  });
+  return res.choices[0].message.content;
+}
+
+function extractJSON(raw) {
+  const clean = raw.replace(/```json\s*/gi, '').replace(/```\s*/gi, '').trim();
+  const match = clean.match(/[\[{][\s\S]*[\]}]/);
+  if (!match) throw new Error('No JSON in GPT response');
+  return JSON.parse(match[0]);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  APEX  —  POST /schedule
+// ═══════════════════════════════════════════════════════════════
+const VALID_CATS = ['fitness','biz','study','church','rest','health','personal'];
+
+const SCHEDULE_SYSTEM = `You are APEX Schedule AI — a brutally disciplined time-blocking engine.
+
+ABSOLUTE RULES — violate any and the output is invalid:
+1. ONE activity per block. Never list multiple tasks in one block.
+2. If N tasks are provided, generate at least N separate blocks — one per task. No merging ever.
+3. Every block has a unique start time (format: "h:mm AM/PM", e.g. "7:30 AM").
+4. duration is a STRING like "45 min" or "1 hr 30 min".
+5. Blocks in strict chronological order. No overlaps.
+6. category must be exactly one of: fitness, biz, study, church, rest, health, personal.
+7. Church on Thursday evenings is always non-negotiable: 6:00 PM to 8:00 PM.
+8. Build transition, meal, and rest blocks between major blocks as separate entries.
+9. activity: one specific sentence describing only that single task.
+10. xp: fitness=50, biz=60, study=45, church=30, rest=10, health=35, personal=25.
+11. Always include a quote of the day.
+12. Respect the user's FIXED schedule exactly — never move fixed commitments.
+13. Return raw JSON only. No markdown. No explanation.
+
+JSON schema:
+{
+  "quote": { "text": "...", "author": "..." },
+  "blocks": [{ "time": "7:00 AM", "duration": "45 min", "activity": "...", "category": "fitness", "xp": 50 }],
+  "summary": "One punchy motivational sentence.",
+  "totalXP": 0
+}`;
+
+app.post('/schedule', async (req, res) => {
+  try {
+    const {
+      username = 'Operator', tasks = [], wakeTime = '6:30 AM', sleepTime = '10:30 PM',
+      notes = '', date = new Date().toDateString(), currentTime = '', currentDay = '',
+      profileAge = '', profileSchool = '', profileSports = '',
+      profilePracticeDays = '', profilePracticeTime = '',
+      profileBusiness = '', profileGoals = '', profileOther = '',
+      profileSchedule = '', profileContext = '',
+    } = req.body;
+
+    const profileLines = [
+      profileAge          && `Age: ${profileAge}`,
+      profileSchool       && `School: ${profileSchool}`,
+      profileSports       && `Sports/training: ${profileSports}`,
+      profilePracticeDays && `Practice days: ${profilePracticeDays}`,
+      profilePracticeTime && `Practice time: ${profilePracticeTime}`,
+      profileBusiness     && `Business/projects: ${profileBusiness}`,
+      profileGoals        && `Goals: ${profileGoals}`,
+      profileOther        && `Other commitments: ${profileOther}`,
+      profileSchedule     && `\nFIXED SCHEDULE (build around this exactly):\n${profileSchedule}`,
+    ].filter(Boolean);
+    if (!profileLines.length && profileContext) profileLines.push(profileContext);
+
+    const taskBlock = tasks.length
+      ? `TASKS — each MUST become its own separate block (${tasks.length} task${tasks.length > 1 ? 's' : ''} = at least ${tasks.length} block${tasks.length > 1 ? 's' : ''}):\n` +
+        tasks.map((t, i) => `  Task ${i + 1}: ${t}`).join('\n')
+      : 'No specific tasks — build a well-balanced productive day.';
+
+    const userPrompt = [
+      `Operator: ${username}`,
+      `Date: ${date}${currentDay ? ` (${currentDay})` : ''}${currentTime ? `  |  Current time: ${currentTime}` : ''}`,
+      `Wake: ${wakeTime}  |  Sleep: ${sleepTime}`,
+      notes && `Notes: ${notes}`,
+      profileLines.length && `\n--- OPERATOR PROFILE ---\n${profileLines.join('\n')}`,
+      `\n--- TASKS ---\n${taskBlock}`,
+      `\nReminder: every numbered task gets its own block. Do NOT merge any two.`,
+    ].filter(Boolean).join('\n');
+
+    const raw    = await gpt(SCHEDULE_SYSTEM, userPrompt, { maxTokens: 2500, temp: 0.35 });
+    const parsed = extractJSON(raw);
+
+    const blocks = (parsed.blocks || []).map(b => ({
+      time:     b.time     || '8:00 AM',
+      duration: b.duration || '30 min',
+      activity: b.activity || b.title || 'Block',
+      category: VALID_CATS.includes(b.category) ? b.category : 'personal',
+      xp:       Number(b.xp) || 25,
+    }));
+
+    const totalXP = blocks.reduce((s, b) => s + b.xp, 0);
+    const quote   = parsed.quote?.text
+      ? parsed.quote
+      : { text: 'Discipline is the bridge between goals and accomplishment.', author: 'Jim Rohn' };
+
+    res.json({
+      success: true,
+      data: {
+        quote,
+        blocks,
+        summary:  parsed.summary || `${blocks.length} blocks locked. ${totalXP} XP on the line.`,
+        totalXP,
+      },
+    });
+  } catch (err) {
+    console.error('[/schedule]', err.message);
+    res.status(500).json({
+      success: false, error: err.message,
+      data: { quote: { text: 'Show up. Do the work.', author: 'APEX' }, blocks: [], summary: 'Failed.', totalXP: 0 },
+    });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  SHARED AI CHAT  —  POST /api/chat
+//  Used by: APEX, NEXUS, AURA, KINETIC
+// ═══════════════════════════════════════════════════════════════
 app.post('/api/chat', async (req, res) => {
   try {
-    const { system, messages, app: appName = 'unknown' } = req.body;
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      max_tokens: 1000,
-      messages: [
-        { role: 'system', content: system || 'You are a helpful assistant for Night.inc.' },
-        ...(messages || []),
-      ],
-    });
-    res.json({ reply: completion.choices[0].message.content });
+    const { system = '', messages = [] } = req.body;
+    const reply = await gpt(
+      system || 'You are a helpful Night.inc AI assistant. Be direct and concise. Max 150 words.',
+      messages,
+      { maxTokens: 500, temp: 0.7 }
+    );
+    res.json({ reply });
   } catch (err) {
     console.error('[/api/chat]', err.message);
     res.status(500).json({ reply: 'AI offline. Try again shortly.' });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-//  APEX — schedule generator
-//  POST /schedule  { name, wakeTime, goals, habits, ... }
-// ─────────────────────────────────────────────────────────────
-app.post('/schedule', async (req, res) => {
-  try {
-    const profile = req.body;
-    const prompt = `You are an elite life-optimization AI. Generate a tight daily schedule for:
-${JSON.stringify(profile, null, 2)}
-Return a JSON array of { time, activity, duration, category } objects. Be specific and motivating.`;
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      max_tokens: 1500,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
-    res.json({ schedule: JSON.parse(raw) });
-  } catch (err) {
-    console.error('[/schedule]', err.message);
-    res.status(500).json({ schedule: [] });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-//  INDEX — curriculum routes
-//  POST /ai/curriculum/build   { topic }
-//  POST /ai/curriculum/expand  { topic, unitIndex, unitTitle }
-//  POST /ai/curriculum/chat    { topic, messages }
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  INDEX  —  AI CURRICULUM
+// ═══════════════════════════════════════════════════════════════
 app.post('/ai/curriculum/build', async (req, res) => {
   try {
     const { topic } = req.body;
-    const prompt = `Create a 5-unit course outline for: "${topic}".
-Return JSON only: { title, description, units: [{ title, emoji, objective }] }
-Exactly 5 units. No markdown.`;
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', max_tokens: 2500,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
-    res.json(JSON.parse(raw));
+    const raw = await gpt(
+      'You are an expert curriculum designer. Return raw JSON only — no markdown.',
+      `Create a 5-unit course for: "${topic}".
+Return: { "title": "...", "description": "...", "units": [{ "title": "...", "emoji": "...", "objective": "..." }] }
+Exactly 5 units.`,
+      { maxTokens: 800, temp: 0.5 }
+    );
+    res.json(extractJSON(raw));
   } catch (err) {
+    console.error('[/ai/curriculum/build]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -275,160 +212,103 @@ Exactly 5 units. No markdown.`;
 app.post('/ai/curriculum/expand', async (req, res) => {
   try {
     const { topic, unitIndex, unitTitle } = req.body;
-    const prompt = `For the course "${topic}", unit ${unitIndex+1}: "${unitTitle}".
-Generate 3 learn cards and 5 exercises.
-Return JSON only: { learnCards: [{ type, concept, keyFact, analogy }], exercises: [{ type, question, options, answer, explanation }] }
-Exercise types: multiple_choice, true_false, fill_blank, code_output, arrange. No markdown.`;
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', max_tokens: 2000,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
-    res.json(JSON.parse(raw));
+    const raw = await gpt(
+      'You are an expert educator. Return raw JSON only — no markdown.',
+      `Course: "${topic}" | Unit ${Number(unitIndex) + 1}: "${unitTitle}".
+Return: { "learnCards": [{ "type": "concept|keyFact|analogy", "concept": "...", "keyFact": "...", "analogy": "..." }], "exercises": [{ "type": "multiple_choice|true_false|fill_blank|code_output|arrange", "question": "...", "options": ["..."], "answer": "...", "explanation": "..." }] }
+3 learn cards, 5 exercises.`,
+      { maxTokens: 2000, temp: 0.5 }
+    );
+    res.json(extractJSON(raw));
   } catch (err) {
+    console.error('[/ai/curriculum/expand]', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 app.post('/ai/curriculum/chat', async (req, res) => {
   try {
-    const { topic, messages } = req.body;
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', max_tokens: 800,
-      messages: [
-        { role: 'system', content: `You are a tutor for the course: "${topic}". Be concise and clear.` },
-        ...(messages || []),
-      ],
-    });
-    res.json({ reply: completion.choices[0].message.content });
+    const { topic, messages = [] } = req.body;
+    const reply = await gpt(
+      `You are a tutor for the course: "${topic}". Be concise and encouraging. Max 100 words.`,
+      messages,
+      { maxTokens: 300, temp: 0.6 }
+    );
+    res.json({ reply });
   } catch (err) {
-    res.status(500).json({ reply: 'AI offline.' });
+    console.error('[/ai/curriculum/chat]', err.message);
+    res.status(500).json({ reply: 'Tutor offline.' });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-//  WARDROBE — outfit generation (2AM-aware, 45% 2AM inclusion)
-//  POST /api/outfits  { closet: [{ id, name, type, brand, color, pattern }], mood?, occasion? }
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  WARDROBE  —  OUTFIT GENERATION
+//  45% of outfits must anchor on a 2AM piece
+// ═══════════════════════════════════════════════════════════════
 app.post('/api/outfits', async (req, res) => {
   try {
     const { closet = [], mood, occasion } = req.body;
-
-    // Separate 2AM pieces from everything else
-    const twoAmPieces  = closet.filter(i => i.brand === '2AM');
-    const otherPieces  = closet.filter(i => i.brand !== '2AM');
-
-    // Build 2AM catalog context for the AI
-    const catalogContext = TWO_AM_CATALOG.map(p =>
-      `- ${p.name} (${p.type}) | Colors: ${p.colorNames.join(', ')} | Patterns: ${p.patterns.join(', ')}`
-    ).join('\n');
-
-    const prompt = `You are a streetwear stylist for Night.inc. The brand 2AM makes ONLY dark/black pieces (void black, deep black, washed black, charcoal) with motifs like oversized graphics, chest embroidery, dropped shoulders, side tape, minimal wordmarks.
-
-2AM catalog (only these exact pieces can be recognized as 2AM):
-${catalogContext}
-
-User's closet:
-2AM pieces: ${JSON.stringify(twoAmPieces)}
-Other pieces: ${JSON.stringify(otherPieces)}
-
+    const twoAm = closet.filter(i => i.brand === '2AM');
+    const other = closet.filter(i => i.brand !== '2AM');
+    const raw = await gpt(
+      `You are a streetwear stylist for Night.inc. 2AM = always dark/black, oversized graphics, chest embroidery, dropped shoulders, minimal wordmarks.
 Rules:
-1. Generate 3 outfit combinations.
-2. AT LEAST 1 outfit must include a 2AM piece (target: 2 out of 3 outfits use 2AM as the anchor).
-3. For 2AM pieces: describe styling notes specific to the actual color and pattern (e.g. "void black oversized graphic tee with chest logo").
-4. NEVER reference brand names other than 2AM. Describe other pieces by type/color only.
-5. Each outfit: name, 3-4 pieces, vibe description (1 sentence), 2AM_anchor: true/false.
-
-Return JSON only: { outfits: [{ name, pieces: [{ id, name, role }], vibe, twoAmAnchor }] }`;
-
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', max_tokens: 1200,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
-    res.json(JSON.parse(raw));
+1. Generate 3 outfits.
+2. At least 2 must anchor on a 2AM piece.
+3. NEVER name any brand other than 2AM. Describe other pieces by type/color only.
+4. Return raw JSON only.
+Schema: { "outfits": [{ "name": "...", "vibe": "...", "pieces": [{ "id": "...", "name": "...", "role": "..." }], "twoAmAnchor": true }] }`,
+      `2AM pieces: ${JSON.stringify(twoAm)}\nOther pieces: ${JSON.stringify(other)}\nMood: ${mood || 'any'} | Occasion: ${occasion || 'any'}`,
+      { maxTokens: 1200, temp: 0.6 }
+    );
+    res.json(extractJSON(raw));
   } catch (err) {
     console.error('[/api/outfits]', err.message);
     res.status(500).json({ outfits: [] });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-//  WARDROBE — 2AM scanner recognition
-//  POST /api/wardrobe/scan  { imageBase64, colorSample: '#hex' }
-//  Returns confidence score + matched product if >= 80%
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  WARDROBE  —  2AM SCANNER  (80% threshold)
+// ═══════════════════════════════════════════════════════════════
+const TWO_AM_CATALOG = [
+  { id: 'iceman-tee-blk',      name: 'ICEMAN Tee',        type: 'tee',      collection: 'ICEMAN', colorNames: ['Black','Washed Black'],                    patterns: ['graphic-front','chest-logo'] },
+  { id: 'iceman-vol2-tee-blk', name: 'ICEMAN Vol.2 Tee',  type: 'tee',      collection: 'ICEMAN', colorNames: ['Black','Off Black','Midnight Navy','Void'], patterns: ['oversized-graphic','ice-print','sleeve-hit'] },
+  { id: 'og-hoodie-blk',       name: '2AM OG Hoodie',     type: 'hoodie',   collection: 'CORE',   colorNames: ['Black'],                                    patterns: ['embroidered-chest','ribbed-cuffs'] },
+  { id: 'night-joggers-blk',   name: 'Night Joggers',     type: 'bottoms',  collection: 'CORE',   colorNames: ['Black','Charcoal'],                         patterns: ['side-tape','ankle-rib'] },
+  { id: 'cargo-shorts-blk',    name: '2AM Cargo Shorts',  type: 'bottoms',  collection: 'SUMMER', colorNames: ['Black'],                                    patterns: ['cargo-pockets','logo-tab'] },
+  { id: 'night-cap-blk',       name: 'Night Cap 6-Panel', type: 'headwear', collection: 'CORE',   colorNames: ['Black','Black/Tan'],                        patterns: ['embroidered-front','unstructured'] },
+];
+
+const NEVER_MATCH = ['supreme','nike','adidas','off-white','palace','stussy','fear-of-god','essentials','champion','carhartt','stone-island'];
+
 app.post('/api/wardrobe/scan', async (req, res) => {
   try {
     const { imageBase64, colorSample, userDescription } = req.body;
-
     const catalogDesc = TWO_AM_CATALOG.map(p =>
-      `ID: ${p.id} | Name: ${p.name} | Type: ${p.type} | Colors: ${p.colorNames.join(', ')} | Patterns: ${p.patterns.join(', ')} | Collection: ${p.collection}`
+      `ID: ${p.id} | ${p.name} | Colors: ${p.colorNames.join(', ')} | Patterns: ${p.patterns.join(', ')}`
     ).join('\n');
 
-    const neverMatch = TWO_AM_VISUAL_FINGERPRINTS.neverMatch.join(', ');
-
-    const messages = [];
-
-    // If we have an image, send it to vision
+    let messages;
     if (imageBase64) {
-      messages.push({
+      messages = [{
         role: 'user',
         content: [
-          {
-            type: 'image_url',
-            image_url: { url: `data:image/jpeg;base64,${imageBase64}`, detail: 'low' },
-          },
-          {
-            type: 'text',
-            text: `You are a 2AM clothing brand recognition AI. ONLY recognize items from the 2AM brand catalog below. NEVER recognize these brands: ${neverMatch}.
-
-2AM CATALOG:
-${catalogDesc}
-
-2AM design fingerprint:
-- Color palette: void black (#0a0a0a), deep black (#111111), washed black (#1a1a1a), charcoal (#2a2a2a), gold accent (#c8a96e)
-- Motifs: oversized graphics, chest embroidery, dropped shoulders, side tape, minimal wordmarks, ice graphics, night-themed prints
-- Always monochrome/dark palette
-
-Analyze this garment image. 
-1. Does it match 2AM's exact color palette and design language?
-2. Which catalog item is the closest match (if any)?
-3. Assign a confidence score 0-100.
-
-If confidence < 80: return { match: false, confidence: <score>, reason: "<why it doesn't match>" }
-If confidence >= 80: return { match: true, confidence: <score>, productId: "<id from catalog>", productName: "<name>", colorMatch: "<matched color name>", patternMatch: "<matched pattern>" }
-
-Return JSON only. No markdown.`,
-          },
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}`, detail: 'low' } },
+          { type: 'text', text: `2AM catalog:\n${catalogDesc}\nNEVER match: ${NEVER_MATCH.join(', ')}\nConfidence >= 80 = match.\nReturn JSON only: { "match": bool, "confidence": 0-100, "productId": "id or null", "productName": "...", "colorMatch": "...", "patternMatch": "...", "reason": "..." }` },
         ],
-      });
+      }];
     } else {
-      // Text-only fallback using description + color sample
-      messages.push({
-        role: 'user',
-        content: `2AM catalog: ${catalogDesc}
-User description: "${userDescription || 'no description'}"
-Dominant color from scanner: ${colorSample || 'unknown'}
-Does this match any 2AM piece at 80%+ confidence?
-Return JSON: { match: bool, confidence: number, productId: string|null, productName: string|null, colorMatch: string|null, patternMatch: string|null, reason: string }`,
-      });
+      messages = [{ role: 'user', content: `Catalog:\n${catalogDesc}\nDescription: "${userDescription || ''}"\nColor: ${colorSample || 'unknown'}\nReturn JSON: { "match": bool, "confidence": number, "productId": string|null, "productName": string|null, "colorMatch": string|null, "patternMatch": string|null, "reason": string }` }];
     }
 
     const completion = await openai.chat.completions.create({
       model: imageBase64 ? 'gpt-4o' : 'gpt-4o-mini',
       max_tokens: 400,
-      messages,
+      messages: [{ role: 'system', content: 'Clothing recognition AI. Return raw JSON only.' }, ...messages],
     });
-
-    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
-    const result = JSON.parse(raw);
-
-    // Attach full product data if matched
-    if (result.match && result.productId) {
-      result.product = TWO_AM_CATALOG.find(p => p.id === result.productId) || null;
-    }
-
+    const result = extractJSON(completion.choices[0].message.content);
+    if (result.match && result.productId) result.product = TWO_AM_CATALOG.find(p => p.id === result.productId) || null;
     res.json(result);
   } catch (err) {
     console.error('[/api/wardrobe/scan]', err.message);
@@ -437,229 +317,82 @@ Return JSON: { match: bool, confidence: number, productId: string|null, productN
 });
 
 // ─────────────────────────────────────────────────────────────
-//  WARDROBE — validate activation code
-//  POST /api/wardrobe/validate-code  { code }
+//  WARDROBE CODES  (in-memory; swap for Redis in production)
 // ─────────────────────────────────────────────────────────────
-app.post('/api/wardrobe/validate-code', (req, res) => {
-  const { code } = req.body;
-  const entry = wardrobeCodes.get(code);
-  if (!entry) return res.status(404).json({ valid: false, reason: 'Code not found.' });
-  if (entry.claimed) return res.status(409).json({ valid: false, reason: 'Already claimed.' });
-
-  entry.claimed  = true;
-  entry.claimedAt = new Date().toISOString();
-  wardrobeSet(code, entry);
-
-  const product = TWO_AM_CATALOG.find(p => p.id === entry.productId);
-  res.json({ valid: true, product, orderId: entry.orderId });
-});
-
-// ─────────────────────────────────────────────────────────────
-//  WARDROBE — get 2AM catalog (for closet matching)
-//  GET /api/wardrobe/catalog
-// ─────────────────────────────────────────────────────────────
-app.get('/api/wardrobe/catalog', (req, res) => {
-  res.json({
-    catalog: TWO_AM_CATALOG,
-    visualFingerprints: TWO_AM_VISUAL_FINGERPRINTS,
-  });
-});
-
-// ─────────────────────────────────────────────────────────────
-//  PRINTIFY HELPER — fetch ALL pages of products
-// ─────────────────────────────────────────────────────────────
-async function fetchAllPrintifyProducts() {
-  const products = [];
-  let page = 1;
-  const shopId = process.env.PRINTIFY_SHOP_ID || '17605284';
-  while (true) {
-    const r = await fetch(
-      `https://api.printify.com/v1/shops/${shopId}/products.json?limit=50&page=${page}`,
-      { headers: { Authorization: `Bearer ${process.env.PRINTIFY_API_KEY}` } }
-    );
-    if (!r.ok) break;
-    const data = await r.json();
-    const items = data.data || [];
-    products.push(...items);
-    if (items.length < 50) break; // last page
-    page++;
-  }
-  return products;
+const wardrobeCodes = new Map();
+function makeCode() {
+  return `WARDROBE-${crypto.randomBytes(2).toString('hex').toUpperCase()}-${Math.floor(Math.random()*900+100)}`;
 }
 
-// Normalize a raw Printify product into a clean store product object.
-// Only products tagged 'showfloor' are shown.
-// Price: use retail_price (already in dollars as float) from the first enabled variant.
-// Never use internal cost — only what the customer pays.
-function normalizePrintifyProduct(p) {
-  // Only enabled variants
-  const enabledVariants = (p.variants || []).filter(v => v.is_enabled);
-  if (enabledVariants.length === 0) return null;
+app.post('/api/wardrobe/validate-code', (req, res) => {
+  const entry = wardrobeCodes.get(req.body.code);
+  if (!entry)          return res.status(404).json({ valid: false, reason: 'Code not found.' });
+  if (entry.claimed)   return res.status(409).json({ valid: false, reason: 'Already claimed.' });
+  entry.claimed = true; entry.claimedAt = new Date().toISOString();
+  res.json({ valid: true, product: TWO_AM_CATALOG.find(p => p.id === entry.productId) || null, orderId: entry.orderId });
+});
 
-  // retail_price is a float in dollars (e.g. 38.00). If missing fall back to
-  // price field which Printify returns in cents when >500, dollars otherwise.
-  const firstVariant = enabledVariants[0];
-  let retailPriceDollars;
-  if (firstVariant.retail_price != null) {
-    // retail_price is already dollars
-    retailPriceDollars = parseFloat(firstVariant.retail_price);
-  } else if (firstVariant.price != null) {
-    const raw = parseFloat(firstVariant.price);
-    // Printify sometimes returns price in cents (>500) vs dollars
-    retailPriceDollars = raw > 500 ? raw / 100 : raw;
-  } else {
-    retailPriceDollars = 0;
+app.get('/api/wardrobe/catalog', (_req, res) => {
+  res.json({ catalog: TWO_AM_CATALOG, colorPalette: ['#0a0a0a','#111111','#1a1a1a','#2a2a2a','#c8a96e','#ffffff'], neverMatch: NEVER_MATCH });
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  2AM STORE  —  PRINTIFY + STRIPE
+// ═══════════════════════════════════════════════════════════════
+async function fetchPrintifyProducts() {
+  const shopId = process.env.PRINTIFY_SHOP_ID || '17605284';
+  const all = [];
+  let page = 1;
+  while (true) {
+    const r = await fetch(`https://api.printify.com/v1/shops/${shopId}/products.json?limit=50&page=${page}`, { headers: { Authorization: `Bearer ${process.env.PRINTIFY_API_KEY}` } });
+    if (!r.ok) break;
+    const data = await r.json();
+    all.push(...(data.data || []));
+    if ((data.data || []).length < 50) break;
+    page++;
   }
+  return all;
+}
 
-  // Collect unique size options across enabled variants
-  const sizes = [...new Set(
-    enabledVariants
-      .map(v => v.title || v.label || '')
-      .filter(t => /^(XS|S|M|L|XL|XXL|OS|S\/M|L\/XL)/i.test(t))
-  )];
-
-  // Collect color options
-  const colors = [...new Set(
-    enabledVariants
-      .map(v => (v.options || []).find(o => o.type === 'color')?.title || v.title || '')
-      .filter(Boolean)
-  )];
-
-  // Best image
-  const image = p.images?.[0]?.src || null;
-
-  // Map Printify category to internal type
-  const titleLower = (p.title || '').toLowerCase();
-  let type = 'tee';
-  if (/hoodie|sweat/i.test(titleLower))    type = 'hoodie';
-  else if (/jogger|pant|trouser/i.test(titleLower)) type = 'bottoms';
-  else if (/short/i.test(titleLower))      type = 'shorts';
-  else if (/cap|hat|beanie/i.test(titleLower)) type = 'headwear';
-  else if (/jacket|coat/i.test(titleLower)) type = 'jacket';
-
+function normalizePrintifyProduct(p) {
+  const enabled = (p.variants || []).filter(v => v.is_enabled);
+  if (!enabled.length) return null;
+  const first = enabled[0];
+  const raw = first.retail_price != null ? parseFloat(first.retail_price) : (parseFloat(first.price || 0) > 500 ? parseFloat(first.price) / 100 : parseFloat(first.price || 0));
+  const t = (p.title || '').toLowerCase();
+  const type = /hoodie|sweat/i.test(t) ? 'hoodie' : /jogger|pant/i.test(t) ? 'bottoms' : /short/i.test(t) ? 'shorts' : /cap|hat/i.test(t) ? 'headwear' : 'tee';
   return {
-    id:          p.id,
-    printifyId:  p.id,
-    name:        p.title,
-    description: p.description || '',
-    type,
-    collection:  (p.tags || []).find(t => !['showfloor','tapstitch'].includes(t)) || 'CORE',
-    // price in cents for consistent internal handling
-    price:       Math.round(retailPriceDollars * 100),
-    // also expose dollars directly so frontend never has to guess
-    priceDollars: retailPriceDollars.toFixed(2),
-    colors,
-    sizes,
-    image,
-    tags:        p.tags || [],
-    inStock:     enabledVariants.some(v => v.is_available !== false),
-    variants:    enabledVariants.map(v => ({
-      id:    v.id,
-      title: v.title,
-      price: Math.round(
-        v.retail_price != null
-          ? parseFloat(v.retail_price) * 100
-          : (parseFloat(v.price) > 500 ? parseFloat(v.price) : parseFloat(v.price) * 100)
-      ),
-      priceDollars: v.retail_price != null
-        ? parseFloat(v.retail_price).toFixed(2)
-        : (parseFloat(v.price) > 500 ? (parseFloat(v.price)/100).toFixed(2) : parseFloat(v.price).toFixed(2)),
-    })),
+    id: p.id, printifyId: p.id, name: p.title, type,
+    collection: (p.tags || []).find(tg => tg !== 'showfloor') || 'CORE',
+    price: Math.round(raw * 100), priceDollars: raw.toFixed(2),
+    colors: [...new Set(enabled.map(v => (v.options||[]).find(o=>o.type==='color')?.title||v.title||'').filter(Boolean))],
+    sizes:  [...new Set(enabled.map(v => v.title||'').filter(s => /^(XS|S|M|L|XL|XXL|OS|S\/M|L\/XL)/i.test(s)))],
+    image: p.images?.[0]?.src || null, tags: p.tags || [],
+    inStock: enabled.some(v => v.is_available !== false),
+    variants: enabled.map(v => { const vp = v.retail_price != null ? parseFloat(v.retail_price) : (parseFloat(v.price||0)>500 ? parseFloat(v.price)/100 : parseFloat(v.price||0)); return { id: v.id, title: v.title, price: Math.round(vp*100), priceDollars: vp.toFixed(2) }; }),
   };
 }
 
-// ─────────────────────────────────────────────────────────────
-//  2AM STORE — product listing
-//  GET /api/store/products
-//  Returns only products tagged 'showfloor', with real retail prices.
-// ─────────────────────────────────────────────────────────────
-app.get('/api/store/products', async (req, res) => {
+app.get('/api/store/products', async (_req, res) => {
   try {
-    if (!process.env.PRINTIFY_API_KEY) {
-      return res.json({ products: TWO_AM_CATALOG.filter(p => p.inStock), source: 'catalog' });
-    }
-
-    const all = await fetchAllPrintifyProducts();
-
-    // Only showfloor-tagged products
-    const showFloor = all.filter(p =>
-      Array.isArray(p.tags) && p.tags.includes('showfloor')
-    );
-
-    // Normalize and drop any that have no enabled variants
-    const normalized = showFloor
-      .map(normalizePrintifyProduct)
-      .filter(Boolean)
-      .filter(p => p.inStock);
-
-    return res.json({ products: normalized, source: 'printify', count: normalized.length });
+    if (!process.env.PRINTIFY_API_KEY) return res.json({ products: TWO_AM_CATALOG, source: 'catalog' });
+    const all        = await fetchPrintifyProducts();
+    const normalized = all.filter(p => (p.tags||[]).includes('showfloor')).map(normalizePrintifyProduct).filter(Boolean).filter(p => p.inStock);
+    res.json({ products: normalized, source: 'printify', count: normalized.length });
   } catch (err) {
     console.error('[/api/store/products]', err.message);
-    res.json({ products: TWO_AM_CATALOG.filter(p => p.inStock), source: 'catalog' });
+    res.json({ products: TWO_AM_CATALOG, source: 'catalog' });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-//  2AM STORE — create Stripe checkout session
-//  POST /api/store/checkout
-//  { items: [{ productId, printifyId, variantId, name, price, quantity, size }] }
-//  price must be in cents (Printify retail_price * 100)
-// ─────────────────────────────────────────────────────────────
 app.post('/api/store/checkout', async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Stripe not configured.' });
   try {
     const { items = [], customerEmail } = req.body;
-
-    for (const item of items) {
-      if (!item.price || item.price <= 0) {
-        return res.status(400).json({ error: `Missing price for: ${item.name}` });
-      }
-    }
-
-    const lineItems = items.map(item => ({
-      price_data: {
-        currency: 'usd',
-        product_data: {
-          name: `${item.name}${item.size ? ' \u2014 ' + item.size : ''}`,
-          metadata: {
-            productId:  item.productId  || '',
-            printifyId: String(item.printifyId || ''),
-            variantId:  String(item.variantId  || ''),
-            size:       item.size || '',
-          },
-        },
-        unit_amount: item.price, // cents — actual Printify retail price
-      },
-      quantity: item.quantity || 1,
-    }));
-
-    const shippingCents = 499 + Math.max(0, items.length - 1) * 150;
-    lineItems.push({
-      price_data: {
-        currency: 'usd',
-        product_data: { name: 'Standard Shipping (5-8 business days)' },
-        unit_amount: shippingCents,
-      },
-      quantity: 1,
-    });
-
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: lineItems,
-      mode: 'payment',
-      customer_email: customerEmail || undefined,
-      success_url: 'https://2amcases.com/order-confirmation?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url:  'https://2amcases.com/catalog.html',
-      metadata: {
-        items: JSON.stringify(items.map(i => ({
-          productId:  i.productId,
-          printifyId: i.printifyId,
-          variantId:  i.variantId,
-          size:       i.size,
-          name:       i.name,
-        }))),
-      },
-    });
-
+    for (const i of items) if (!i.price || i.price <= 0) return res.status(400).json({ error: `Missing price for: ${i.name}` });
+    const lineItems = items.map(i => ({ price_data: { currency: 'usd', product_data: { name: `${i.name}${i.size ? ` — ${i.size}` : ''}`, metadata: { productId: i.productId||'', printifyId: String(i.printifyId||''), variantId: String(i.variantId||''), size: i.size||'' } }, unit_amount: i.price }, quantity: i.quantity||1 }));
+    lineItems.push({ price_data: { currency: 'usd', product_data: { name: 'Standard Shipping (5-8 business days)' }, unit_amount: 499 + Math.max(0, items.length-1)*150 }, quantity: 1 });
+    const session = await stripe.checkout.sessions.create({ payment_method_types: ['card'], line_items: lineItems, mode: 'payment', customer_email: customerEmail||undefined, success_url: 'https://2amcases.com/order-confirmation?session_id={CHECKOUT_SESSION_ID}', cancel_url: 'https://2amcases.com/catalog.html', metadata: { items: JSON.stringify(items.map(i => ({ productId: i.productId, printifyId: i.printifyId, variantId: i.variantId, size: i.size, name: i.name }))) } });
     res.json({ url: session.url, sessionId: session.id });
   } catch (err) {
     console.error('[/api/store/checkout]', err.message);
@@ -667,303 +400,39 @@ app.post('/api/store/checkout', async (req, res) => {
   }
 });
 
-
-
-// ─────────────────────────────────────────────────────────────
-//  2AM STORE — Stripe webhook (order fulfillment + WARDROBE codes)
-//  POST /webhook/stripe
-// ─────────────────────────────────────────────────────────────
 app.post('/webhook/stripe', async (req, res) => {
-  const sig = req.headers['stripe-signature'];
+  if (!stripe) return res.status(503).send('Stripe not configured.');
   let event;
-  try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
+  try { event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET); }
+  catch (err) { return res.status(400).send(`Webhook error: ${err.message}`); }
   if (event.type === 'checkout.session.completed') {
     const session = event.data.object;
     const items   = JSON.parse(session.metadata?.items || '[]');
-
+    const shopId  = process.env.PRINTIFY_SHOP_ID || '17605284';
     for (const item of items) {
-      const code    = generateWardrobeCode();
-      const orderId = session.id;
-
-      // Store the code (persisted to disk)
-      wardrobeSet(code, {
-        productId: item.productId,
-        orderId,
-        claimed: false,
-        createdAt: new Date().toISOString(),
-      });
-
-      // If Printify product, submit order
-      if (process.env.PRINTIFY_API_KEY && item.printifyId) {
+      const code = makeCode();
+      wardrobeCodes.set(code, { productId: item.productId, orderId: session.id, claimed: false, createdAt: new Date().toISOString() });
+      console.log(`[Order] ${session.id} -> WARDROBE code ${code}`);
+      if (process.env.PRINTIFY_API_KEY && item.printifyId && item.variantId) {
         try {
-          // Map Stripe shipping_details to Printify's required address format
-          const sd   = session.shipping_details || {};
-          const addr = sd.address || {};
-          const nameParts = (sd.name || '').trim().split(/\s+/);
-          const printifyAddress = {
-            first_name:   nameParts[0] || 'Customer',
-            last_name:    nameParts.slice(1).join(' ') || 'Night.inc',
-            email:        session.customer_email || '',
-            phone:        '',
-            country_code: addr.country || 'US',
-            region:       addr.state   || '',
-            address1:     addr.line1   || '',
-            address2:     addr.line2   || '',
-            city:         addr.city    || '',
-            zip:          addr.postal_code || '',
-          };
-
-          await fetch(`https://api.printify.com/v1/shops/${process.env.PRINTIFY_SHOP_ID}/orders.json`, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${process.env.PRINTIFY_API_KEY}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              external_id:     orderId,
-              line_items:      [{ product_id: item.printifyId, variant_id: item.variantId, quantity: 1 }],
-              shipping_method: 1,
-              address_to:      printifyAddress,
-            }),
-          });
-        } catch (e) {
-          console.error('[Printify order]', e.message);
-        }
+          await fetch(`https://api.printify.com/v1/shops/${shopId}/orders.json`, { method: 'POST', headers: { Authorization: `Bearer ${process.env.PRINTIFY_API_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ external_id: session.id, line_items: [{ product_id: item.printifyId, variant_id: item.variantId, quantity: 1 }], shipping_method: 1, address_to: session.shipping_details?.address || {} }) });
+        } catch (e) { console.error('[Printify order]', e.message); }
       }
-
-      console.log(`[Order] ${orderId} → code ${code} for product ${item.productId}`);
     }
   }
-
   res.json({ received: true });
 });
 
-// ─────────────────────────────────────────────────────────────
-//  2AM STORE — order confirmation (called by confirmation page)
-//  GET /api/store/order?session_id=...
-// ─────────────────────────────────────────────────────────────
 app.get('/api/store/order', async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Stripe not configured.' });
   try {
-    const { session_id } = req.query;
-    const session = await stripe.checkout.sessions.retrieve(session_id, {
-      expand: ['line_items'],
-    });
-
-    // Find WARDROBE codes for this order
-    const codes = [];
+    const session = await stripe.checkout.sessions.retrieve(req.query.session_id, { expand: ['line_items'] });
+    const codes   = [];
     for (const [code, entry] of wardrobeCodes.entries()) {
-      if (entry.orderId === session_id) {
-        const product = TWO_AM_CATALOG.find(p => p.id === entry.productId);
-        codes.push({ code, product, claimed: entry.claimed });
-      }
+      if (entry.orderId === req.query.session_id) codes.push({ code, product: TWO_AM_CATALOG.find(p => p.id === entry.productId)||null, claimed: entry.claimed });
     }
-
-    res.json({
-      orderId: session.id,
-      customerEmail: session.customer_email,
-      total: session.amount_total,
-      status: session.payment_status,
-      items: session.line_items?.data || [],
-      wardrobeCodes: codes,
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-//  KINETIC — AI meal plan
-//  POST /api/kinetic/meal  { calories, macros, restrictions }
-// ─────────────────────────────────────────────────────────────
-app.post('/api/kinetic/meal', async (req, res) => {
-  try {
-    const { calories, macros, restrictions } = req.body;
-    const prompt = `Generate a 1-day meal plan for ${calories} calories.
-Macros target: ${JSON.stringify(macros)}.
-Restrictions: ${restrictions || 'none'}.
-Return JSON: { meals: [{ name, calories, protein, carbs, fat, time }] }`;
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', max_tokens: 800,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
-    res.json(JSON.parse(raw));
-  } catch (err) {
-    res.status(500).json({ meals: [] });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-//  AURA — skin analysis
-//  POST /api/aura/analyze  { imageBase64, skinConcerns, environment }
-// ─────────────────────────────────────────────────────────────
-app.post('/api/aura/analyze', async (req, res) => {
-  try {
-    const { imageBase64, skinConcerns, environment } = req.body;
-    const messages = imageBase64
-      ? [{
-          role: 'user',
-          content: [
-            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}`, detail: 'low' } },
-            { type: 'text', text: `Analyze this face image for skin health. Concerns: ${skinConcerns || 'general'}. Environment: ${JSON.stringify(environment || {})}. Return JSON: { score: 0-100, issues: [], routine: [{ step, product, when }], tips: [] }` },
-          ],
-        }]
-      : [{ role: 'user', content: `Skin analysis for concerns: ${skinConcerns}. Return JSON: { score: 0-100, issues: [], routine: [], tips: [] }` }];
-
-    const completion = await openai.chat.completions.create({
-      model: imageBase64 ? 'gpt-4o' : 'gpt-4o-mini',
-      max_tokens: 800,
-      messages,
-    });
-    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
-    res.json(JSON.parse(raw));
-  } catch (err) {
-    res.status(500).json({ score: 0, issues: [], routine: [], tips: [] });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-//  NEXUS — idea action plan
-//  POST /api/nexus/idea  { idea, businessName }
-// ─────────────────────────────────────────────────────────────
-app.post('/api/nexus/idea', async (req, res) => {
-  try {
-    const { idea, businessName } = req.body;
-    const prompt = `You are a sharp business strategist. The founder runs "${businessName}". 
-Idea: "${idea}". 
-Create a concise action plan. Return JSON: { summary, steps: [{ action, timeline, effort }], risks: [], verdict: 'hot'|'test'|'skip' }`;
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o', max_tokens: 600,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const raw = completion.choices[0].message.content.replace(/```json|```/g, '').trim();
-    res.json(JSON.parse(raw));
-  } catch (err) {
-    res.status(500).json({ summary: 'AI offline', steps: [], risks: [], verdict: 'skip' });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-//  APEX — streak engine
-//
-//  Rules:
-//    1. Streak only increments if founderKeyActive === true
-//       (biometric Founder-Key must be active — no key, no log)
-//    2. Midnight reset uses Florida / Eastern Time (handles DST)
-//    3. Chris Mode: 12-hour grace window
-//       If chrisMode === true, the "yesterday" check extends to
-//       36 hours since last log instead of 24 — so logging at
-//       2AM after midnight still counts as the previous day's log
-//    4. Double-logging on the same day is a no-op (idempotent)
-//
-//  POST /api/apex/streak/log   { userId, founderKeyActive, chrisMode? }
-//  GET  /api/apex/streak/:userId
-//  POST /api/apex/streak/reset { userId }   (dev/admin only — no prod exposure without auth)
-// ─────────────────────────────────────────────────────────────
-
-// File-persisted streak store (survives Railway restarts)
-const STREAKS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp', 'apex_streaks.json');
-
-function readStreaksFile() {
-  try { return JSON.parse(fs.readFileSync(STREAKS_FILE, 'utf8')); }
-  catch { return {}; }
-}
-function writeStreaksFile(data) {
-  try { fs.writeFileSync(STREAKS_FILE, JSON.stringify(data), 'utf8'); }
-  catch (e) { console.error('[apex-streaks] write error:', e.message); }
-}
-
-const apexStreaks = new Map(Object.entries(readStreaksFile()));
-console.log(`[apex-streaks] Loaded ${apexStreaks.size} streak(s) from disk.`);
-
-function streakSet(userId, entry) {
-  apexStreaks.set(userId, entry);
-  writeStreaksFile(Object.fromEntries(apexStreaks));
-}
-
-// Returns today's date string in Eastern Time (Florida), e.g. "2026-06-10"
-// Uses Intl to handle DST automatically — no manual offset math
-function getEasternDateString(date = new Date()) {
-  return new Intl.DateTimeFormat('en-CA', { // en-CA gives YYYY-MM-DD format
-    timeZone: 'America/New_York',
-  }).format(date);
-}
-
-app.post('/api/apex/streak/log', (req, res) => {
-  const { userId = 'default', founderKeyActive = false, chrisMode = false } = req.body;
-
-  // Gate 1: Founder-Key required
-  if (!founderKeyActive) {
-    const current = apexStreaks.get(userId);
-    return res.status(403).json({
-      logged:   false,
-      reason:   'Founder-Key biometric required to log streak.',
-      streak:   current?.streak ?? 0,
-      lastLogDate: current?.lastLogDate ?? null,
-    });
-  }
-
-  const now     = new Date();
-  const todayET = getEasternDateString(now);
-  const existing = apexStreaks.get(userId);
-
-  // No prior record — first-ever log
-  if (!existing) {
-    streakSet(userId, { streak: 1, lastLogDate: todayET, chrisMode, updatedAt: now.toISOString() });
-    return res.json({ logged: true, streak: 1, continued: false, firstLog: true, date: todayET });
-  }
-
-  // Already logged today — idempotent, no change
-  if (existing.lastLogDate === todayET) {
-    return res.json({ logged: false, reason: 'Already logged today.', streak: existing.streak, date: todayET });
-  }
-
-  // Compute hours since last log to decide whether streak continues
-  const lastLogTime   = new Date(existing.updatedAt);
-  const hoursSinceLast = (now - lastLogTime) / (1000 * 60 * 60);
-
-  // Standard window: 24h–48h gap means yesterday's date is the last log
-  // Chris Mode grace: extends window to 36h (12-hour grace past midnight)
-  const windowHours = chrisMode ? 36 : 28; // 28h = small normal buffer past midnight
-
-  if (hoursSinceLast <= windowHours) {
-    // Streak continues
-    const newStreak = existing.streak + 1;
-    streakSet(userId, { streak: newStreak, lastLogDate: todayET, chrisMode, updatedAt: now.toISOString() });
-    return res.json({ logged: true, streak: newStreak, continued: true, chrisMode, date: todayET });
-  } else {
-    // Streak broken — reset to 1
-    streakSet(userId, { streak: 1, lastLogDate: todayET, chrisMode, updatedAt: now.toISOString() });
-    return res.json({ logged: true, streak: 1, continued: false, streakReset: true, date: todayET });
-  }
-});
-
-app.get('/api/apex/streak/:userId', (req, res) => {
-  const { userId } = req.params;
-  const data = apexStreaks.get(userId);
-
-  if (!data) {
-    return res.json({ userId, streak: 0, lastLogDate: null, active: false });
-  }
-
-  const todayET = getEasternDateString();
-  // "active" = user has already logged today
-  const active = data.lastLogDate === todayET;
-
-  res.json({
-    userId,
-    streak:         data.streak,
-    lastLogDate:    data.lastLogDate,
-    active,
-    chrisMode:      data.chrisMode,
-    updatedAt:      data.updatedAt,
-    todayET,
-  });
+    res.json({ orderId: session.id, customerEmail: session.customer_email, total: session.amount_total, status: session.payment_status, items: session.line_items?.data||[], wardrobeCodes: codes });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -971,6 +440,6 @@ app.get('/api/apex/streak/:userId', (req, res) => {
 // ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Night.inc Unified Backend running on port ${PORT}`);
-  console.log(`Apps served: APEX (streak engine) · WARDROBE · INDEX · NEXUS · KINETIC · AURA · 2AM`);
+  console.log(`Night.inc Unified Backend v4.0 — port ${PORT}`);
+  console.log('Apps: APEX | NEXUS | AURA | KINETIC | INDEX | WARDROBE | 2AM');
 });
