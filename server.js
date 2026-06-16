@@ -40,7 +40,7 @@ app.use(express.json({ limit: '10mb' }));
 app.get('/', (_req, res) => {
   res.json({
     service: 'Night.inc Unified Backend',
-    version: '4.0.0',
+    version: '4.1.0',
     status:  'online',
     apps:    ['APEX', 'NEXUS', 'AURA', 'KINETIC', 'INDEX', 'WARDROBE', '2AM'],
   });
@@ -72,9 +72,21 @@ function extractJSON(raw) {
 // ═══════════════════════════════════════════════════════════════
 const VALID_CATS = ['fitness','biz','study','church','rest','health','personal'];
 
-const SCHEDULE_SYSTEM = `You are APEX Schedule AI — a brutally disciplined time-blocking engine.
+const SCHEDULE_SYSTEM = `You are APEX Schedule AI — a brutally disciplined, hyper-personalized time-blocking engine.
 
-ABSOLUTE RULES — violate any and the output is invalid:
+Your #1 job: use the operator's REAL life — their actual business, sport, school, goals, and schedule — to generate SPECIFIC, detailed tasks. Generic tasks like "wake up and drink water" or "work on your business" are FAILURES. Every activity must reference what this specific person is actually doing.
+
+PERSONALIZATION RULES (most important):
+- If they have a business: name it. Write tasks like "Film 2 Instagram Reels for 2AM drop campaign" not "work on business"
+- If they play a sport: be specific. "Film your dribbling for 15 min and review your weak hand" not "train basketball"
+- If they have school: reference it. "Complete chapter 4 reading for AP History" not "study"
+- If they have goals: build toward them. "Research 3 POD fulfillment partners for 2AM" not "do research"
+- Use their name where natural. Make them feel like this schedule was hand-built for them.
+- Morning routine blocks should reference their actual wake time and include specific actions (hydration, prayer, journaling etc) based on their profile
+- Transition and meal blocks should feel intentional, not filler
+- If they wrote a NOTES field, treat those as the highest priority tasks of the day and build specific blocks around them
+
+ABSOLUTE STRUCTURE RULES — violate any and the output is invalid:
 1. ONE activity per block. Never list multiple tasks in one block.
 2. If N tasks are provided, generate at least N separate blocks — one per task. No merging ever.
 3. Every block has a unique start time (format: "h:mm AM/PM", e.g. "7:30 AM").
@@ -83,9 +95,9 @@ ABSOLUTE RULES — violate any and the output is invalid:
 6. category must be exactly one of: fitness, biz, study, church, rest, health, personal.
 7. Church on Thursday evenings is always non-negotiable: 6:00 PM to 8:00 PM.
 8. Build transition, meal, and rest blocks between major blocks as separate entries.
-9. activity: one specific sentence describing only that single task.
+9. activity: one specific sentence describing only that single task — USE THEIR REAL LIFE DETAILS.
 10. xp: fitness=50, biz=60, study=45, church=30, rest=10, health=35, personal=25.
-11. Always include a quote of the day.
+11. Always include a quote of the day relevant to their specific goals.
 12. Respect the user's FIXED schedule exactly — never move fixed commitments.
 13. Return raw JSON only. No markdown. No explanation.
 
@@ -93,7 +105,7 @@ JSON schema:
 {
   "quote": { "text": "...", "author": "..." },
   "blocks": [{ "time": "7:00 AM", "duration": "45 min", "activity": "...", "category": "fitness", "xp": 50 }],
-  "summary": "One punchy motivational sentence.",
+  "summary": "One punchy motivational sentence referencing their actual goals.",
   "totalXP": 0
 }`;
 
@@ -124,16 +136,16 @@ app.post('/schedule', async (req, res) => {
     const taskBlock = tasks.length
       ? `TASKS — each MUST become its own separate block (${tasks.length} task${tasks.length > 1 ? 's' : ''} = at least ${tasks.length} block${tasks.length > 1 ? 's' : ''}):\n` +
         tasks.map((t, i) => `  Task ${i + 1}: ${t}`).join('\n')
-      : 'No specific tasks — build a well-balanced productive day.';
+      : 'No specific tasks — build a well-balanced productive day tailored to this operator\'s real life and goals.';
 
     const userPrompt = [
       `Operator: ${username}`,
       `Date: ${date}${currentDay ? ` (${currentDay})` : ''}${currentTime ? `  |  Current time: ${currentTime}` : ''}`,
       `Wake: ${wakeTime}  |  Sleep: ${sleepTime}`,
-      notes && `Notes: ${notes}`,
+      notes && `Notes (HIGH PRIORITY — build specific blocks around these): ${notes}`,
       profileLines.length && `\n--- OPERATOR PROFILE ---\n${profileLines.join('\n')}`,
       `\n--- TASKS ---\n${taskBlock}`,
-      `\nReminder: every numbered task gets its own block. Do NOT merge any two.`,
+      `\nReminder: every numbered task gets its own block. Do NOT merge any two. Use the operator's real business, sport, school, and goals in every activity description.`,
     ].filter(Boolean).join('\n');
 
     const raw    = await gpt(SCHEDULE_SYSTEM, userPrompt, { maxTokens: 2500, temp: 0.35 });
@@ -440,6 +452,6 @@ app.get('/api/store/order', async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Night.inc Unified Backend v4.0 — port ${PORT}`);
+  console.log(`Night.inc Unified Backend v4.1 — port ${PORT}`);
   console.log('Apps: APEX | NEXUS | AURA | KINETIC | INDEX | WARDROBE | 2AM');
 });
