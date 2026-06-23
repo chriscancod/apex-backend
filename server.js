@@ -446,7 +446,17 @@ app.get('/api/store/order', async (req, res) => {
     res.json({ orderId: session.id, customerEmail: session.customer_email, total: session.amount_total, status: session.payment_status, items: session.line_items?.data||[], wardrobeCodes: codes });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  ** NODE.JS BACKEND PATCH **                                     ║
+// ║  FILE: server-patch.js  (instructions only — not a full file)    ║
+// ║  WHERE: Open your existing server.js / index.js in nightcode     ║
+// ║  WHAT:  Copy these 2 lines into your server.js to wire security  ║
+// ╚══════════════════════════════════════════════════════════════════╝
+// ADD THESE LINES to your existing server.js / index.js
+// (wherever you define your express routes)
 
+const jarvisSecurity = require('./jarvis-security')
+app.use('/api/jarvis/security', jarvisSecurity)
 // ─────────────────────────────────────────────────────────────
 //  START
 // ─────────────────────────────────────────────────────────────
